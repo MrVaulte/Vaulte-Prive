@@ -5,6 +5,9 @@ const { Pool } = require("pg");
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 
+const MIN_CIPHERTEXT_BYTES = 1;
+const MAX_CIPHERTEXT_BYTES = 256 * 1024;
+
 // 🔌 Подключение к Supabase (PostgreSQL)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -68,6 +71,44 @@ function validateMessageDTO(body) {
     return "invalid date";
   }
 
+  const opaqueErr = validateOpaqueCipherBase64(body.ciphertext_base64);
+  if (opaqueErr) {
+    return opaqueErr;
+  }
+
+  return null;
+}
+
+/**
+ * Relay never decrypts. We only reject payloads that look like raw UTF-8 text
+ * (accidental plaintext). Real OTP/XOR or AEAD ciphertext should look high-entropy.
+ */
+function validateOpaqueCipherBase64(b64) {
+  let buf;
+  try {
+    buf = Buffer.from(b64, "base64");
+  } catch {
+    return "invalid base64 decode";
+  }
+  if (buf.length < MIN_CIPHERTEXT_BYTES) {
+    return "ciphertext_too_short";
+  }
+  if (buf.length > MAX_CIPHERTEXT_BYTES) {
+    return "ciphertext_too_large";
+  }
+  if (buf.length >= 24) {
+    let printable = 0;
+    for (let i = 0; i < buf.length; i++) {
+      const b = buf[i];
+      if (b >= 0x20 && b <= 0x7e) {
+        printable++;
+      }
+    }
+    const ratio = printable / buf.length;
+    if (ratio > 0.97) {
+      return "rejected_plaintext_like_payload";
+    }
+  }
   return null;
 }
 
