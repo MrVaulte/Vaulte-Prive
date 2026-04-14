@@ -476,6 +476,29 @@ app.put("/users/:userId", requireApiKey, requireRelaySignature, async (req, res)
   }
 });
 
+app.delete("/users/:userId/hard-reset", requireApiKey, requireRelaySignature, async (req, res) => {
+  const { userId } = req.params;
+  if (!UUID_RE.test(userId)) {
+    return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`DELETE FROM messages WHERE sender_id = $1::uuid OR recipient_id = $1::uuid`, [userId]);
+    await client.query(`DELETE FROM users WHERE user_id = $1::uuid`, [userId]);
+    await client.query(`DELETE FROM user_identity_keys WHERE user_id = $1::uuid`, [userId]);
+    await client.query(`DELETE FROM pad_batches WHERE owner_user_id = $1::uuid`, [userId]);
+    await client.query("COMMIT");
+    return res.json({ status: "hard_reset_completed", request_id: req.id });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    log("error", "hard_reset_db", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/keys/:userId", requireApiKey, requireRelaySignature, async (req, res) => {
   const { userId } = req.params;
   if (!UUID_RE.test(userId)) {
@@ -733,6 +756,42 @@ app.get(
       return res.json(result.rows);
     } catch (e) {
       log("error", "get_messages_db", {
+        message: e.message,
+        request_id: req.id,
+      });
+      return res.status(500).json({ error: "db_error", request_id: req.id });
+    }
+  }
+);
+
+app.delete(
+  "/conversations/:conversationId/messages",
+  requireApiKey,
+  requireRelaySignature,
+  async (req, res) => {
+    const { conversationId } = req.params;
+    if (!UUID_RE.test(conversationId)) {
+      return res.status(400).json({ error: "invalid_conversation_id", request_id: req.id });
+    }
+    const requesterUserId = String(req.query.user_id || "").trim();
+    if (!UUID_RE.test(requesterUserId)) {
+      return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
+    }
+
+    try {
+      const result = await pool.query(
+        `DELETE FROM messages
+         WHERE conversation_id = $1::uuid
+           AND (sender_id = $2::uuid OR recipient_id = $2::uuid)`,
+        [conversationId, requesterUserId]
+      );
+      return res.json({
+        status: "conversation_messages_deleted",
+        deleted_count: result.rowCount || 0,
+        request_id: req.id,
+      });
+    } catch (e) {
+      log("error", "delete_conversation_messages_db", {
         message: e.message,
         request_id: req.id,
       });
