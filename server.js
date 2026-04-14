@@ -741,6 +741,63 @@ app.get(
   }
 );
 
+app.get(
+  "/messages/inbox/:recipientId",
+  requireApiKey,
+  requireRelaySignature,
+  getMessagesLimiter,
+  async (req, res) => {
+    const { recipientId } = req.params;
+    if (!UUID_RE.test(recipientId)) {
+      return res.status(400).json({
+        error: "invalid recipient_id",
+        request_id: req.id,
+      });
+    }
+
+    const sinceRaw = req.query.since;
+    const since =
+      typeof sinceRaw === "string" && sinceRaw.length > 0
+        ? sinceRaw
+        : "1970-01-01T00:00:00.000Z";
+
+    const n =
+      req.query.limit === undefined ? NaN : Number(req.query.limit);
+    const limit = Math.min(
+      Math.max(Number.isFinite(n) ? Math.floor(n) : 50, 1),
+      200
+    );
+
+    try {
+      const result = await pool.query(
+        `SELECT
+        message_id,
+        conversation_id,
+        sender_id,
+        recipient_id,
+        pad_id,
+        ciphertext_base64,
+        created_at
+       FROM messages
+       WHERE recipient_id = $1::uuid
+         AND (created_at::timestamptz) > $2::timestamptz
+       ORDER BY created_at ASC
+       LIMIT $3`,
+        [recipientId, since, limit]
+      );
+
+      res.setHeader("Cache-Control", "private, no-store");
+      return res.json(result.rows);
+    } catch (e) {
+      log("error", "get_inbox_db", {
+        message: e.message,
+        request_id: req.id,
+      });
+      return res.status(500).json({ error: "db_error", request_id: req.id });
+    }
+  }
+);
+
 // 404
 app.use((req, res) => {
   res.status(404).json({ error: "not_found", request_id: req.id });
