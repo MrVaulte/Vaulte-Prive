@@ -22,6 +22,7 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const RELAY_API_KEY = process.env.RELAY_API_KEY?.trim();
 const RELAY_HMAC_SECRET = process.env.RELAY_HMAC_SECRET?.trim();
 const RELAY_HMAC_WINDOW_SEC = Number(process.env.RELAY_HMAC_WINDOW_SEC || 300);
+const RELAY_ADMIN_SECRET = process.env.RELAY_ADMIN_SECRET?.trim();
 const RELAY_ALLOWED_ORIGINS = process.env.RELAY_ALLOWED_ORIGINS?.split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -499,6 +500,112 @@ app.delete("/users/:userId/hard-reset", requireApiKey, requireRelaySignature, as
   }
 });
 
+// --- Admin middleware ---
+function requireAdmin(req, res, next) {
+  if (!RELAY_ADMIN_SECRET) {
+    return res.status(503).json({ error: "admin_not_configured", request_id: req.id });
+  }
+  const token = req.headers["x-admin-secret"]?.trim();
+  if (!token || token !== RELAY_ADMIN_SECRET) {
+    return res.status(403).json({ error: "forbidden", request_id: req.id });
+  }
+  next();
+}
+
+// --- Verification badges ---
+
+// GET /badges/:userId — fetch a user's badge (public)
+app.get("/badges/:userId", requireApiKey, requireRelaySignature, async (req, res) => {
+  const { userId } = req.params;
+  if (!UUID_RE.test(userId)) {
+    return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
+  }
+  try {
+    const result = await pool.query(
+      `SELECT user_id, badge_type, granted_by, granted_at
+       FROM user_badges
+       WHERE user_id = $1::uuid
+       LIMIT 1`,
+      [userId]
+    );
+    if (result.rowCount === 0) {
+      return res.json({ user_id: userId, badge_type: null });
+    }
+    return res.json(result.rows[0]);
+  } catch (e) {
+    log("error", "get_badge_db", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
+  }
+});
+
+// GET /badges — list all badged users
+app.get("/badges", requireApiKey, requireRelaySignature, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT b.user_id, b.badge_type, b.granted_by, b.granted_at,
+              u.username
+       FROM user_badges b
+       LEFT JOIN users u ON u.user_id = b.user_id
+       ORDER BY b.granted_at DESC
+       LIMIT 500`
+    );
+    return res.json({ badges: result.rows });
+  } catch (e) {
+    log("error", "list_badges_db", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
+  }
+});
+
+// PUT /badges/:userId — admin grants or updates a badge
+// badge_type: "official" (admin-granted, gold) or "verified" (purchased, blue)
+app.put("/badges/:userId", requireApiKey, requireAdmin, async (req, res) => {
+  const { userId } = req.params;
+  if (!UUID_RE.test(userId)) {
+    return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
+  }
+  const badgeType = req.body?.badge_type;
+  if (!["official", "verified"].includes(badgeType)) {
+    return res.status(400).json({ error: "invalid_badge_type", valid: ["official", "verified"], request_id: req.id });
+  }
+  const grantedBy = req.body?.granted_by || "admin";
+  try {
+    const result = await pool.query(
+      `INSERT INTO user_badges (user_id, badge_type, granted_by, granted_at)
+       VALUES ($1::uuid, $2, $3, NOW())
+       ON CONFLICT (user_id) DO UPDATE
+       SET badge_type = EXCLUDED.badge_type,
+           granted_by = EXCLUDED.granted_by,
+           granted_at = NOW()
+       RETURNING user_id, badge_type, granted_by, granted_at`,
+      [userId, badgeType, grantedBy]
+    );
+    log("info", "badge_granted", { user_id: userId, badge_type: badgeType, request_id: req.id });
+    return res.json(result.rows[0]);
+  } catch (e) {
+    log("error", "put_badge_db", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
+  }
+});
+
+// DELETE /badges/:userId — admin revokes a badge
+app.delete("/badges/:userId", requireApiKey, requireAdmin, async (req, res) => {
+  const { userId } = req.params;
+  if (!UUID_RE.test(userId)) {
+    return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
+  }
+  try {
+    await pool.query(
+      `DELETE FROM user_badges WHERE user_id = $1::uuid`,
+      [userId]
+    );
+    log("info", "badge_revoked", { user_id: userId, request_id: req.id });
+    return res.json({ user_id: userId, badge_type: null });
+  } catch (e) {
+    log("error", "delete_badge_db", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
+  }
+});
+
 app.get("/keys/:userId", requireApiKey, requireRelaySignature, async (req, res) => {
   const { userId } = req.params;
   if (!UUID_RE.test(userId)) {
@@ -915,6 +1022,17 @@ async function ensureUsersTable() {
   );
 }
 
+async function ensureBadgesTable() {
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS user_badges (
+      user_id UUID PRIMARY KEY,
+      badge_type TEXT NOT NULL CHECK (badge_type IN ('official', 'verified')),
+      granted_by TEXT NOT NULL DEFAULT 'admin',
+      granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`
+  );
+}
+
 async function ensurePadBatchesTable() {
   await pool.query(
     `CREATE TABLE IF NOT EXISTS pad_batches (
@@ -1243,6 +1361,7 @@ function setupWebSocket(httpServer) {
 async function bootstrap() {
   await verifySchemaOrThrow();
   await ensureUsersTable();
+  await ensureBadgesTable();
   await ensurePadBatchesTable();
   await ensureIdentityKeysTable();
   await sweepExpiredPadBatches();
