@@ -956,6 +956,136 @@ async function ensureIdentityKeysTable() {
   );
 }
 
+// ─── WebSocket signaling for encrypted calls ───────────────────────────
+const WebSocket = require("ws");
+
+const wsClients = new Map(); // userId (string) -> Set<WebSocket>
+
+function wsRegister(userId, ws) {
+  if (!wsClients.has(userId)) wsClients.set(userId, new Set());
+  wsClients.get(userId).add(ws);
+  log("info", "ws_register", { userId, total: wsClients.get(userId).size });
+}
+
+function wsUnregister(userId, ws) {
+  const set = wsClients.get(userId);
+  if (set) {
+    set.delete(ws);
+    if (set.size === 0) wsClients.delete(userId);
+  }
+}
+
+function wsSendTo(targetUserId, payload) {
+  const set = wsClients.get(targetUserId);
+  if (!set || set.size === 0) return false;
+  const raw = Buffer.isBuffer(payload) ? payload : (typeof payload === "string" ? payload : JSON.stringify(payload));
+  for (const ws of set) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(raw);
+  }
+  return true;
+}
+
+function handleSignaling(ws, msg) {
+  const { type, callId, targetUserId, fromUserId } = msg;
+  if (!targetUserId || !fromUserId) return;
+
+  switch (type) {
+    case "call_offer":
+    case "call_answer":
+    case "call_decline":
+    case "call_end":
+    case "call_ice": {
+      const delivered = wsSendTo(targetUserId, msg);
+      if (type === "call_offer" && !delivered) {
+        const reject = JSON.stringify({
+          type: "call_unavailable",
+          callId,
+          targetUserId,
+          reason: "offline",
+        });
+        if (ws.readyState === WebSocket.OPEN) ws.send(reject);
+      }
+      break;
+    }
+    case "audio_frame": {
+      wsSendTo(targetUserId, msg);
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+function setupWebSocket(httpServer) {
+  const wss = new WebSocket.Server({ server: httpServer, path: "/ws" });
+
+  wss.on("connection", (ws, req) => {
+    let registeredUserId = null;
+    let callPeerId = null; // set when call is active, for binary audio routing
+
+    ws.isAlive = true;
+    ws.on("pong", () => { ws.isAlive = true; });
+
+    ws.on("message", (data, isBinary) => {
+      // Binary frames are opaque encrypted audio — relay to call peer
+      if (isBinary || (Buffer.isBuffer(data) && data.length > 0 && data[0] !== 0x7b)) {
+        if (registeredUserId && callPeerId) {
+          wsSendTo(callPeerId, data);
+        }
+        return;
+      }
+
+      let msg;
+      try {
+        msg = JSON.parse(data.toString());
+      } catch {
+        return;
+      }
+
+      if (msg.type === "register" && typeof msg.userId === "string" && msg.userId.length > 0) {
+        if (registeredUserId) wsUnregister(registeredUserId, ws);
+        registeredUserId = msg.userId;
+        wsRegister(registeredUserId, ws);
+        ws.send(JSON.stringify({ type: "registered", userId: registeredUserId }));
+        return;
+      }
+
+      if (!registeredUserId) {
+        ws.send(JSON.stringify({ type: "error", message: "register first" }));
+        return;
+      }
+
+      // Track call peer for binary audio routing
+      if (msg.type === "call_offer" || msg.type === "call_answer") {
+        callPeerId = msg.targetUserId || null;
+      } else if (msg.type === "call_end" || msg.type === "call_decline") {
+        callPeerId = null;
+      }
+
+      handleSignaling(ws, { ...msg, fromUserId: registeredUserId });
+    });
+
+    ws.on("close", () => {
+      if (registeredUserId) wsUnregister(registeredUserId, ws);
+    });
+
+    ws.on("error", () => {
+      if (registeredUserId) wsUnregister(registeredUserId, ws);
+    });
+  });
+
+  const heartbeat = setInterval(() => {
+    wss.clients.forEach((ws) => {
+      if (!ws.isAlive) return ws.terminate();
+      ws.isAlive = false;
+      ws.ping();
+    });
+  }, 30_000);
+
+  wss.on("close", () => clearInterval(heartbeat));
+  log("info", "ws_ready", { path: "/ws" });
+}
+
 async function bootstrap() {
   await verifySchemaOrThrow();
   await ensureUsersTable();
@@ -971,6 +1101,7 @@ async function bootstrap() {
       cors_origins: RELAY_ALLOWED_ORIGINS?.length ?? "any",
     });
   });
+  setupWebSocket(server);
 }
 
 bootstrap().catch((e) => {
