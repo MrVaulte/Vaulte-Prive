@@ -14,6 +14,9 @@ const PORT = Number(process.env.PORT || 3000);
 
 const MIN_CIPHERTEXT_BYTES = 1;
 const MAX_CIPHERTEXT_BYTES = 256 * 1024;
+const PAD_BATCH_DEFAULT_TTL_SEC = Number(process.env.PAD_BATCH_DEFAULT_TTL_SEC || 86400);
+const PAD_BATCH_MAX_PADS = Number(process.env.PAD_BATCH_MAX_PADS || 100);
+const PAD_BATCH_SWEEP_INTERVAL_SEC = Number(process.env.PAD_BATCH_SWEEP_INTERVAL_SEC || 3600);
 
 const DATABASE_URL = process.env.DATABASE_URL;
 const RELAY_API_KEY = process.env.RELAY_API_KEY?.trim();
@@ -97,6 +100,17 @@ function timingSafeEqualHex(a, b) {
   return crypto.timingSafeEqual(aa, bb);
 }
 
+function canonicalizeURL(originalUrl) {
+  const [path, queryString = ""] = String(originalUrl || "").split("?");
+  if (!queryString) return path;
+  const params = new URLSearchParams(queryString);
+  const sorted = [...params.entries()].sort(([ak, av], [bk, bv]) =>
+    ak === bk ? av.localeCompare(bv) : ak.localeCompare(bk)
+  );
+  const canonicalQuery = new URLSearchParams(sorted).toString();
+  return canonicalQuery ? `${path}?${canonicalQuery}` : path;
+}
+
 /**
  * Optional tamper/replay protection:
  * X-Relay-Timestamp: unix seconds
@@ -119,7 +133,8 @@ function requireRelaySignature(req, res, next) {
   }
 
   const raw = req.rawBody ? req.rawBody.toString("utf8") : "";
-  const canonical = `${ts}.${req.method.toUpperCase()}.${req.originalUrl}.${raw}`;
+  const canonicalPath = canonicalizeURL(req.originalUrl);
+  const canonical = `${ts}.${req.method.toUpperCase()}.${canonicalPath}.${raw}`;
   const expected = crypto.createHmac("sha256", RELAY_HMAC_SECRET).update(canonical).digest("hex");
   if (!timingSafeEqualHex(expected, sig)) {
     return res.status(401).json({ error: "bad_signature", request_id: req.id });
@@ -250,6 +265,47 @@ function normalizeUsername(input) {
   return withoutPrefix;
 }
 
+function makePadBatchToken() {
+  const a = crypto.randomBytes(3).toString("hex").toUpperCase();
+  const b = crypto.randomBytes(1).toString("hex").toUpperCase();
+  return `VP-${a}-${b}`;
+}
+
+function validatePadBatchBody(body) {
+  if (!body || typeof body !== "object") return "invalid_body";
+  if (!UUID_RE.test(body.conversation_id)) return "invalid_conversation_id";
+  if (body.direction !== "inbound" && body.direction !== "outbound") return "invalid_direction";
+  if (!Array.isArray(body.pads) || body.pads.length === 0) return "invalid_pads";
+  if (body.pads.length > PAD_BATCH_MAX_PADS) return "pads_limit_exceeded";
+  for (const p of body.pads) {
+    if (!p || typeof p !== "object") return "invalid_pad_entry";
+    if (!UUID_RE.test(p.id)) return "invalid_pad_id";
+    if (typeof p.bytes_b64 !== "string" || p.bytes_b64.length === 0) return "invalid_pad_bytes";
+    let bytes;
+    try {
+      bytes = Buffer.from(p.bytes_b64, "base64");
+    } catch {
+      return "invalid_pad_bytes";
+    }
+    if (!bytes || bytes.length < 16 || bytes.length > 4096) return "invalid_pad_bytes_length";
+    if (!isIsoDate(p.created_at)) return "invalid_pad_created_at";
+  }
+  if (body.owner_user_id && !UUID_RE.test(body.owner_user_id)) return "invalid_owner_user_id";
+  if (body.ttl_seconds !== undefined) {
+    const ttl = Number(body.ttl_seconds);
+    if (!Number.isFinite(ttl) || ttl < 60 || ttl > 30 * 24 * 3600) return "invalid_ttl_seconds";
+  }
+  return null;
+}
+
+async function sweepExpiredPadBatches() {
+  try {
+    await pool.query(`DELETE FROM pad_batches WHERE expires_at < NOW()`);
+  } catch (e) {
+    log("error", "sweep_pad_batches_failed", { message: e.message });
+  }
+}
+
 // --- Routes ---
 
 app.get("/", (_req, res) => {
@@ -374,6 +430,106 @@ app.put("/users/:userId", requireApiKey, requireRelaySignature, async (req, res)
       return res.status(409).json({ error: "username_taken", request_id: req.id });
     }
     log("error", "put_user_db", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
+  }
+});
+
+app.post("/pad-batches", requireApiKey, requireRelaySignature, async (req, res) => {
+  const err = validatePadBatchBody(req.body);
+  if (err) {
+    return res.status(400).json({ error: err, request_id: req.id });
+  }
+
+  const body = req.body;
+  const ttlSec = Number.isFinite(Number(body.ttl_seconds))
+    ? Number(body.ttl_seconds)
+    : PAD_BATCH_DEFAULT_TTL_SEC;
+  const expiresAt = new Date(Date.now() + ttlSec * 1000).toISOString();
+
+  try {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const token = makePadBatchToken();
+      try {
+        await pool.query(
+          `INSERT INTO pad_batches
+          (token, conversation_id, direction, pads_json, owner_user_id, expires_at, created_at, consumed_at, consume_count)
+          VALUES ($1, $2::uuid, $3, $4::jsonb, $5::uuid, $6::timestamptz, NOW(), NULL, 0)`,
+          [
+            token,
+            body.conversation_id,
+            body.direction,
+            JSON.stringify(body.pads),
+            body.owner_user_id || null,
+            expiresAt,
+          ]
+        );
+        return res.status(201).json({ token, expires_at: expiresAt, request_id: req.id });
+      } catch (inner) {
+        if (inner && inner.code === "23505") {
+          continue;
+        }
+        throw inner;
+      }
+    }
+    return res.status(500).json({ error: "token_generation_failed", request_id: req.id });
+  } catch (e) {
+    log("error", "create_pad_batch_db", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
+  }
+});
+
+app.post("/pad-batches/:token/consume", requireApiKey, requireRelaySignature, async (req, res) => {
+  const token = String(req.params.token || "").trim().toUpperCase();
+  if (!/^VP-[A-Z0-9]{6}-[A-Z0-9]{2}$/.test(token)) {
+    return res.status(400).json({ error: "invalid_token", request_id: req.id });
+  }
+  const requesterUserId = req.body?.requester_user_id;
+  if (requesterUserId && !UUID_RE.test(requesterUserId)) {
+    return res.status(400).json({ error: "invalid_requester_user_id", request_id: req.id });
+  }
+  try {
+    await sweepExpiredPadBatches();
+    const result = await pool.query(
+      `SELECT token, conversation_id, direction, pads_json, owner_user_id, expires_at, consumed_at, consume_count
+       FROM pad_batches
+       WHERE token = $1
+       LIMIT 1`,
+      [token]
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "batch_not_found", request_id: req.id });
+    }
+    const row = result.rows[0];
+    if (new Date(row.expires_at).getTime() <= Date.now()) {
+      return res.status(410).json({ error: "batch_expired", request_id: req.id });
+    }
+    if (row.consumed_at) {
+      return res.status(410).json({ error: "batch_consumed", request_id: req.id });
+    }
+    if (row.owner_user_id && requesterUserId && String(row.owner_user_id) !== String(requesterUserId)) {
+      return res.status(403).json({ error: "owner_mismatch", request_id: req.id });
+    }
+    if (row.owner_user_id && !requesterUserId) {
+      return res.status(400).json({ error: "requester_user_id_required", request_id: req.id });
+    }
+
+    await pool.query(
+      `UPDATE pad_batches
+       SET consumed_at = NOW(), consume_count = consume_count + 1
+       WHERE token = $1 AND consumed_at IS NULL`,
+      [token]
+    );
+    return res.json({
+      token: row.token,
+      conversation_id: row.conversation_id,
+      direction: row.direction,
+      pads: row.pads_json,
+      owner_user_id: row.owner_user_id,
+      expires_at: row.expires_at,
+      request_id: req.id,
+    });
+  } catch (e) {
+    log("error", "fetch_pad_batch_db", { message: e.message, request_id: req.id });
     return res.status(500).json({ error: "db_error", request_id: req.id });
   }
 });
@@ -538,9 +694,39 @@ async function ensureUsersTable() {
   );
 }
 
+async function ensurePadBatchesTable() {
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS pad_batches (
+      token TEXT PRIMARY KEY,
+      conversation_id UUID NOT NULL,
+      direction TEXT NOT NULL,
+      pads_json JSONB NOT NULL,
+      owner_user_id UUID,
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      consumed_at TIMESTAMPTZ,
+      consume_count INTEGER NOT NULL DEFAULT 0
+    )`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_pad_batches_expires_at ON pad_batches (expires_at)`
+  );
+  await pool.query(
+    `ALTER TABLE pad_batches
+     ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ`
+  );
+  await pool.query(
+    `ALTER TABLE pad_batches
+     ADD COLUMN IF NOT EXISTS consume_count INTEGER NOT NULL DEFAULT 0`
+  );
+}
+
 async function bootstrap() {
   await verifySchemaOrThrow();
   await ensureUsersTable();
+  await ensurePadBatchesTable();
+  await sweepExpiredPadBatches();
+  setInterval(sweepExpiredPadBatches, PAD_BATCH_SWEEP_INTERVAL_SEC * 1000).unref();
   server = app.listen(PORT, () => {
     log("info", "listen", {
       port: PORT,
