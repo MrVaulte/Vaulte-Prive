@@ -961,6 +961,112 @@ const WebSocket = require("ws");
 
 const wsClients = new Map(); // userId (string) -> Set<WebSocket>
 
+const WS_MAX_BINARY_FRAME = 4096;
+const WS_BACKPRESSURE_LIMIT = 1_000_000; // bytes
+const WS_HMAC_WINDOW_SEC = RELAY_HMAC_WINDOW_SEC || 300;
+const WS_MSG_RATE_WINDOW_MS = 1000;
+const WS_MSG_RATE_MAX = 60; // max signaling messages per window
+const WS_AUDIO_RATE_WINDOW_MS = 1000;
+const WS_AUDIO_RATE_MAX = 80; // max audio frames per second (~50 expected)
+
+// Replay nonce cache: nonce -> expiry timestamp
+const wsReplayNonces = new Map();
+setInterval(() => {
+  const now = Math.floor(Date.now() / 1000);
+  for (const [nonce, expiry] of wsReplayNonces) {
+    if (expiry < now) wsReplayNonces.delete(nonce);
+  }
+}, 60_000).unref();
+
+// ── WS HMAC authentication ──
+
+function verifyWsHmac(userId, timestamp, nonce, signature) {
+  if (!RELAY_HMAC_SECRET) return true; // auth disabled
+  if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) return false;
+  if (typeof signature !== "string" || signature.length === 0) return false;
+  if (typeof nonce !== "string" || nonce.length === 0) return false;
+
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - timestamp) > WS_HMAC_WINDOW_SEC) return false;
+
+  const nonceKey = `${userId}:${nonce}`;
+  if (wsReplayNonces.has(nonceKey)) return false;
+  wsReplayNonces.set(nonceKey, now + WS_HMAC_WINDOW_SEC + 60);
+
+  const canonical = `ws.register.${userId}.${timestamp}.${nonce}`;
+  const expected = crypto.createHmac("sha256", RELAY_HMAC_SECRET).update(canonical).digest("hex");
+  return timingSafeEqualHex(expected, signature);
+}
+
+function verifyWsMessageHmac(userId, msg) {
+  if (!RELAY_HMAC_SECRET) return true;
+  const { _ts, _nonce, _sig } = msg;
+  if (typeof _ts !== "number" || typeof _nonce !== "string" || typeof _sig !== "string") return false;
+
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - _ts) > WS_HMAC_WINDOW_SEC) return false;
+
+  const nonceKey = `${userId}:${_nonce}`;
+  if (wsReplayNonces.has(nonceKey)) return false;
+  wsReplayNonces.set(nonceKey, now + WS_HMAC_WINDOW_SEC + 60);
+
+  const signable = { ...msg };
+  delete signable._ts;
+  delete signable._nonce;
+  delete signable._sig;
+  const body = JSON.stringify(signable, Object.keys(signable).sort());
+  const canonical = `ws.msg.${userId}.${_ts}.${_nonce}.${body}`;
+  const expected = crypto.createHmac("sha256", RELAY_HMAC_SECRET).update(canonical).digest("hex");
+  return timingSafeEqualHex(expected, _sig);
+}
+
+// ── Conversation ACL: verify both users share a conversation ──
+
+async function verifyConversationAccess(userId, targetUserId, conversationId) {
+  if (!conversationId) return false;
+  try {
+    const result = await pool.query(
+      `SELECT 1 FROM messages
+       WHERE conversation_id = $1
+         AND ((sender_id = $2 AND recipient_id = $3) OR (sender_id = $3 AND recipient_id = $2))
+       LIMIT 1`,
+      [conversationId, userId, targetUserId]
+    );
+    if (result.rows.length > 0) return true;
+
+    // Also check identity keys: both users must have published keys
+    const keys = await pool.query(
+      `SELECT user_id FROM user_identity_keys WHERE user_id IN ($1, $2)`,
+      [userId, targetUserId]
+    );
+    return keys.rows.length === 2;
+  } catch {
+    return false;
+  }
+}
+
+// ── Rate limiter per connection ──
+
+class WsRateLimiter {
+  constructor(windowMs, maxHits) {
+    this.windowMs = windowMs;
+    this.maxHits = maxHits;
+    this.hits = 0;
+    this.windowStart = Date.now();
+  }
+  check() {
+    const now = Date.now();
+    if (now - this.windowStart > this.windowMs) {
+      this.hits = 0;
+      this.windowStart = now;
+    }
+    this.hits++;
+    return this.hits <= this.maxHits;
+  }
+}
+
+// ── Core WS functions ──
+
 function wsRegister(userId, ws) {
   if (!wsClients.has(userId)) wsClients.set(userId, new Set());
   wsClients.get(userId).add(ws);
@@ -980,14 +1086,30 @@ function wsSendTo(targetUserId, payload) {
   if (!set || set.size === 0) return false;
   const raw = Buffer.isBuffer(payload) ? payload : (typeof payload === "string" ? payload : JSON.stringify(payload));
   for (const ws of set) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(raw);
+    if (ws.readyState !== WebSocket.OPEN) continue;
+    // Backpressure: terminate slow consumers
+    if (ws.bufferedAmount > WS_BACKPRESSURE_LIMIT) {
+      log("warn", "ws_backpressure_kill", { target: targetUserId, buffered: ws.bufferedAmount });
+      ws.terminate();
+      continue;
+    }
+    ws.send(raw);
   }
   return true;
 }
 
-function handleSignaling(ws, msg) {
-  const { type, callId, targetUserId, fromUserId } = msg;
+function stripAuthFields(obj) {
+  const clean = { ...obj };
+  delete clean._ts;
+  delete clean._nonce;
+  delete clean._sig;
+  return clean;
+}
+
+function handleSignaling(ws, msg, fromUserId) {
+  const { type, callId, targetUserId } = msg;
   if (!targetUserId || !fromUserId) return;
+  const forwarded = stripAuthFields(msg);
 
   switch (type) {
     case "call_offer":
@@ -995,7 +1117,7 @@ function handleSignaling(ws, msg) {
     case "call_decline":
     case "call_end":
     case "call_ice": {
-      const delivered = wsSendTo(targetUserId, msg);
+      const delivered = wsSendTo(targetUserId, forwarded);
       if (type === "call_offer" && !delivered) {
         const reject = JSON.stringify({
           type: "call_unavailable",
@@ -1007,31 +1129,36 @@ function handleSignaling(ws, msg) {
       }
       break;
     }
-    case "audio_frame": {
-      wsSendTo(targetUserId, msg);
-      break;
-    }
     default:
       break;
   }
 }
 
 function setupWebSocket(httpServer) {
-  const wss = new WebSocket.Server({ server: httpServer, path: "/ws" });
+  const wss = new WebSocket.Server({ server: httpServer, path: "/ws", maxPayload: 8192 });
 
   wss.on("connection", (ws, req) => {
     let registeredUserId = null;
-    let callPeerId = null; // set when call is active, for binary audio routing
+    let callPeerId = null;
+    const msgLimiter = new WsRateLimiter(WS_MSG_RATE_WINDOW_MS, WS_MSG_RATE_MAX);
+    const audioLimiter = new WsRateLimiter(WS_AUDIO_RATE_WINDOW_MS, WS_AUDIO_RATE_MAX);
 
     ws.isAlive = true;
     ws.on("pong", () => { ws.isAlive = true; });
 
     ws.on("message", (data, isBinary) => {
-      // Binary frames are opaque encrypted audio — relay to call peer
+      // ── Binary audio frames ──
       if (isBinary || (Buffer.isBuffer(data) && data.length > 0 && data[0] !== 0x7b)) {
-        if (registeredUserId && callPeerId) {
-          wsSendTo(callPeerId, data);
-        }
+        if (!registeredUserId || !callPeerId) return;
+        if (data.length > WS_MAX_BINARY_FRAME) return; // size cap
+        if (!audioLimiter.check()) return; // rate limit
+        wsSendTo(callPeerId, data);
+        return;
+      }
+
+      // ── Text signaling ──
+      if (!msgLimiter.check()) {
+        ws.send(JSON.stringify({ type: "error", message: "rate_limited" }));
         return;
       }
 
@@ -1042,7 +1169,13 @@ function setupWebSocket(httpServer) {
         return;
       }
 
+      // ── Register (with HMAC auth) ──
       if (msg.type === "register" && typeof msg.userId === "string" && msg.userId.length > 0) {
+        if (!verifyWsHmac(msg.userId, msg.timestamp, msg.nonce, msg.signature)) {
+          ws.send(JSON.stringify({ type: "error", message: "auth_failed" }));
+          ws.close(4001, "auth_failed");
+          return;
+        }
         if (registeredUserId) wsUnregister(registeredUserId, ws);
         registeredUserId = msg.userId;
         wsRegister(registeredUserId, ws);
@@ -1055,14 +1188,35 @@ function setupWebSocket(httpServer) {
         return;
       }
 
-      // Track call peer for binary audio routing
-      if (msg.type === "call_offer" || msg.type === "call_answer") {
+      // ── Verify per-message HMAC ──
+      if (!verifyWsMessageHmac(registeredUserId, msg)) {
+        ws.send(JSON.stringify({ type: "error", message: "sig_failed" }));
+        return;
+      }
+
+      // ── Conversation ACL for call_offer ──
+      if (msg.type === "call_offer") {
+        const convId = msg.conversationId;
+        const target = msg.targetUserId;
+        verifyConversationAccess(registeredUserId, target, convId).then((allowed) => {
+          if (!allowed) {
+            ws.send(JSON.stringify({ type: "error", message: "no_conversation" }));
+            return;
+          }
+          callPeerId = target || null;
+          handleSignaling(ws, { ...msg, fromUserId: registeredUserId }, registeredUserId);
+        });
+        return;
+      }
+
+      // ── Track / clear call peer ──
+      if (msg.type === "call_answer") {
         callPeerId = msg.targetUserId || null;
       } else if (msg.type === "call_end" || msg.type === "call_decline") {
         callPeerId = null;
       }
 
-      handleSignaling(ws, { ...msg, fromUserId: registeredUserId });
+      handleSignaling(ws, { ...msg, fromUserId: registeredUserId }, registeredUserId);
     });
 
     ws.on("close", () => {
