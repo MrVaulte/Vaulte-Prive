@@ -187,6 +187,7 @@ function log(level, event, fields = {}) {
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const USERNAME_RE = /^[a-z0-9_]{3,24}$/;
+const KEY_TYPE_X25519 = "x25519";
 
 function isIsoDate(value) {
   return typeof value === "string" && !Number.isNaN(Date.parse(value));
@@ -265,6 +266,27 @@ function normalizeUsername(input) {
   return withoutPrefix;
 }
 
+function decodeStrictBase64(input) {
+  if (typeof input !== "string") return null;
+  const value = input.trim();
+  if (value.length === 0 || value.length % 4 !== 0) return null;
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return null;
+  let bytes;
+  try {
+    bytes = Buffer.from(value, "base64");
+  } catch {
+    return null;
+  }
+  if (!bytes || bytes.length === 0) return null;
+  if (bytes.toString("base64") !== value) return null;
+  return bytes;
+}
+
+function validatePublicKeyBase64(b64) {
+  const bytes = decodeStrictBase64(b64);
+  return Boolean(bytes && bytes.length === 32);
+}
+
 function makePadBatchToken() {
   const a = crypto.randomBytes(3).toString("hex").toUpperCase();
   const b = crypto.randomBytes(1).toString("hex").toUpperCase();
@@ -281,12 +303,8 @@ function validatePadBatchBody(body) {
     if (!p || typeof p !== "object") return "invalid_pad_entry";
     if (!UUID_RE.test(p.id)) return "invalid_pad_id";
     if (typeof p.bytes_b64 !== "string" || p.bytes_b64.length === 0) return "invalid_pad_bytes";
-    let bytes;
-    try {
-      bytes = Buffer.from(p.bytes_b64, "base64");
-    } catch {
-      return "invalid_pad_bytes";
-    }
+    const bytes = decodeStrictBase64(p.bytes_b64);
+    if (!bytes) return "invalid_pad_bytes";
     if (!bytes || bytes.length < 16 || bytes.length > 4096) return "invalid_pad_bytes_length";
     if (!isIsoDate(p.created_at)) return "invalid_pad_created_at";
   }
@@ -434,6 +452,60 @@ app.put("/users/:userId", requireApiKey, requireRelaySignature, async (req, res)
   }
 });
 
+app.get("/keys/:userId", requireApiKey, requireRelaySignature, async (req, res) => {
+  const { userId } = req.params;
+  if (!UUID_RE.test(userId)) {
+    return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
+  }
+  try {
+    const result = await pool.query(
+      `SELECT user_id, key_type, public_key_base64, updated_at
+       FROM user_identity_keys
+       WHERE user_id = $1::uuid
+       LIMIT 1`,
+      [userId]
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "key_not_found", request_id: req.id });
+    }
+    return res.json(result.rows[0]);
+  } catch (e) {
+    log("error", "get_identity_key_db", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
+  }
+});
+
+app.put("/keys/:userId", requireApiKey, requireRelaySignature, async (req, res) => {
+  const { userId } = req.params;
+  if (!UUID_RE.test(userId)) {
+    return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
+  }
+  const keyType = String(req.body?.key_type || "").trim().toLowerCase();
+  const publicKeyBase64 = req.body?.public_key_base64;
+  if (keyType !== KEY_TYPE_X25519) {
+    return res.status(400).json({ error: "invalid_key_type", request_id: req.id });
+  }
+  if (!validatePublicKeyBase64(publicKeyBase64)) {
+    return res.status(400).json({ error: "invalid_public_key", request_id: req.id });
+  }
+  try {
+    const result = await pool.query(
+      `INSERT INTO user_identity_keys (user_id, key_type, public_key_base64, updated_at)
+       VALUES ($1::uuid, $2, $3, NOW())
+       ON CONFLICT (user_id) DO UPDATE
+       SET key_type = EXCLUDED.key_type,
+           public_key_base64 = EXCLUDED.public_key_base64,
+           updated_at = NOW()
+       RETURNING user_id, key_type, public_key_base64, updated_at`,
+      [userId, keyType, publicKeyBase64]
+    );
+    return res.json(result.rows[0]);
+  } catch (e) {
+    log("error", "put_identity_key_db", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
+  }
+});
+
 app.post("/pad-batches", requireApiKey, requireRelaySignature, async (req, res) => {
   const err = validatePadBatchBody(req.body);
   if (err) {
@@ -489,8 +561,32 @@ app.post("/pad-batches/:token/consume", requireApiKey, requireRelaySignature, as
   }
   try {
     await sweepExpiredPadBatches();
+    const consume = await pool.query(
+      `UPDATE pad_batches
+       SET consumed_at = NOW(),
+           consume_count = consume_count + 1
+       WHERE token = $1
+         AND consumed_at IS NULL
+         AND expires_at > NOW()
+         AND (owner_user_id IS NULL OR owner_user_id = $2::uuid)
+       RETURNING token, conversation_id, direction, pads_json, owner_user_id, expires_at`,
+      [token, requesterUserId || null]
+    );
+    if (consume.rowCount === 1) {
+      const row = consume.rows[0];
+      return res.json({
+        token: row.token,
+        conversation_id: row.conversation_id,
+        direction: row.direction,
+        pads: row.pads_json,
+        owner_user_id: row.owner_user_id,
+        expires_at: row.expires_at,
+        request_id: req.id,
+      });
+    }
+
     const result = await pool.query(
-      `SELECT token, conversation_id, direction, pads_json, owner_user_id, expires_at, consumed_at, consume_count
+      `SELECT token, owner_user_id, expires_at, consumed_at
        FROM pad_batches
        WHERE token = $1
        LIMIT 1`,
@@ -500,34 +596,19 @@ app.post("/pad-batches/:token/consume", requireApiKey, requireRelaySignature, as
       return res.status(404).json({ error: "batch_not_found", request_id: req.id });
     }
     const row = result.rows[0];
+    if (row.owner_user_id && !requesterUserId) {
+      return res.status(400).json({ error: "requester_user_id_required", request_id: req.id });
+    }
+    if (row.owner_user_id && requesterUserId && String(row.owner_user_id) !== String(requesterUserId)) {
+      return res.status(403).json({ error: "owner_mismatch", request_id: req.id });
+    }
     if (new Date(row.expires_at).getTime() <= Date.now()) {
       return res.status(410).json({ error: "batch_expired", request_id: req.id });
     }
     if (row.consumed_at) {
       return res.status(410).json({ error: "batch_consumed", request_id: req.id });
     }
-    if (row.owner_user_id && requesterUserId && String(row.owner_user_id) !== String(requesterUserId)) {
-      return res.status(403).json({ error: "owner_mismatch", request_id: req.id });
-    }
-    if (row.owner_user_id && !requesterUserId) {
-      return res.status(400).json({ error: "requester_user_id_required", request_id: req.id });
-    }
-
-    await pool.query(
-      `UPDATE pad_batches
-       SET consumed_at = NOW(), consume_count = consume_count + 1
-       WHERE token = $1 AND consumed_at IS NULL`,
-      [token]
-    );
-    return res.json({
-      token: row.token,
-      conversation_id: row.conversation_id,
-      direction: row.direction,
-      pads: row.pads_json,
-      owner_user_id: row.owner_user_id,
-      expires_at: row.expires_at,
-      request_id: req.id,
-    });
+    return res.status(409).json({ error: "batch_not_consumable", request_id: req.id });
   } catch (e) {
     log("error", "fetch_pad_batch_db", { message: e.message, request_id: req.id });
     return res.status(500).json({ error: "db_error", request_id: req.id });
@@ -721,10 +802,25 @@ async function ensurePadBatchesTable() {
   );
 }
 
+async function ensureIdentityKeysTable() {
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS user_identity_keys (
+      user_id UUID PRIMARY KEY,
+      key_type TEXT NOT NULL,
+      public_key_base64 TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_identity_keys_updated_at ON user_identity_keys (updated_at)`
+  );
+}
+
 async function bootstrap() {
   await verifySchemaOrThrow();
   await ensureUsersTable();
   await ensurePadBatchesTable();
+  await ensureIdentityKeysTable();
   await sweepExpiredPadBatches();
   setInterval(sweepExpiredPadBatches, PAD_BATCH_SWEEP_INTERVAL_SEC * 1000).unref();
   server = app.listen(PORT, () => {
