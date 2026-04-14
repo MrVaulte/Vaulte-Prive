@@ -22,7 +22,10 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const RELAY_API_KEY = process.env.RELAY_API_KEY?.trim();
 const RELAY_HMAC_SECRET = process.env.RELAY_HMAC_SECRET?.trim();
 const RELAY_HMAC_WINDOW_SEC = Number(process.env.RELAY_HMAC_WINDOW_SEC || 300);
-const RELAY_ADMIN_SECRET = process.env.RELAY_ADMIN_SECRET?.trim();
+const RELAY_ADMIN_USERNAMES = (process.env.RELAY_ADMIN_USERNAMES || "vaulte")
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
 const RELAY_ALLOWED_ORIGINS = process.env.RELAY_ALLOWED_ORIGINS?.split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -500,16 +503,29 @@ app.delete("/users/:userId/hard-reset", requireApiKey, requireRelaySignature, as
   }
 });
 
-// --- Admin middleware ---
-function requireAdmin(req, res, next) {
-  if (!RELAY_ADMIN_SECRET) {
-    return res.status(503).json({ error: "admin_not_configured", request_id: req.id });
-  }
-  const token = req.headers["x-admin-secret"]?.trim();
-  if (!token || token !== RELAY_ADMIN_SECRET) {
+// --- Admin middleware: checks X-Admin-User-Id header against allowed usernames ---
+async function requireAdmin(req, res, next) {
+  const adminUserId = req.headers["x-admin-user-id"]?.trim();
+  if (!adminUserId || !UUID_RE.test(adminUserId)) {
     return res.status(403).json({ error: "forbidden", request_id: req.id });
   }
-  next();
+  try {
+    const result = await pool.query(
+      `SELECT username FROM users WHERE user_id = $1::uuid LIMIT 1`,
+      [adminUserId]
+    );
+    if (result.rowCount === 0) {
+      return res.status(403).json({ error: "forbidden", request_id: req.id });
+    }
+    const username = result.rows[0].username?.toLowerCase();
+    if (!RELAY_ADMIN_USERNAMES.includes(username)) {
+      return res.status(403).json({ error: "forbidden", request_id: req.id });
+    }
+    next();
+  } catch (e) {
+    log("error", "admin_check_failed", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
+  }
 }
 
 // --- Verification badges ---
@@ -558,7 +574,7 @@ app.get("/badges", requireApiKey, requireRelaySignature, async (req, res) => {
 
 // PUT /badges/:userId — admin grants or updates a badge
 // badge_type: "official" (admin-granted, gold) or "verified" (purchased, blue)
-app.put("/badges/:userId", requireApiKey, requireAdmin, async (req, res) => {
+app.put("/badges/:userId", requireApiKey, requireRelaySignature, requireAdmin, async (req, res) => {
   const { userId } = req.params;
   if (!UUID_RE.test(userId)) {
     return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
@@ -588,7 +604,7 @@ app.put("/badges/:userId", requireApiKey, requireAdmin, async (req, res) => {
 });
 
 // DELETE /badges/:userId — admin revokes a badge
-app.delete("/badges/:userId", requireApiKey, requireAdmin, async (req, res) => {
+app.delete("/badges/:userId", requireApiKey, requireRelaySignature, requireAdmin, async (req, res) => {
   const { userId } = req.params;
   if (!UUID_RE.test(userId)) {
     return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
