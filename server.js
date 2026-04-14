@@ -461,6 +461,29 @@ app.put("/users/:userId", requireApiKey, requireRelaySignature, async (req, res)
   if (!normalized) {
     return res.status(400).json({ error: "invalid_username", request_id: req.id });
   }
+
+  // Block non-admins from taking a reserved admin username
+  if (RELAY_ADMIN_USERNAMES.includes(normalized.toLowerCase())) {
+    const existing = await pool.query(
+      `SELECT user_id FROM users WHERE LOWER(username) = $1 LIMIT 1`,
+      [normalized.toLowerCase()]
+    );
+    if (existing.rowCount > 0 && existing.rows[0].user_id !== userId) {
+      return res.status(403).json({ error: "admin_username_reserved", request_id: req.id });
+    }
+  }
+
+  // Block renaming an admin account to a different username
+  if (await isProtectedAdmin(userId)) {
+    const current = await pool.query(
+      `SELECT username FROM users WHERE user_id = $1::uuid LIMIT 1`,
+      [userId]
+    );
+    if (current.rowCount > 0 && current.rows[0].username?.toLowerCase() !== normalized.toLowerCase()) {
+      return res.status(403).json({ error: "admin_username_locked", request_id: req.id });
+    }
+  }
+
   try {
     const result = await pool.query(
       `INSERT INTO users (user_id, username, updated_at)
@@ -485,6 +508,10 @@ app.delete("/users/:userId/hard-reset", requireApiKey, requireRelaySignature, as
   if (!UUID_RE.test(userId)) {
     return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
   }
+  if (await isProtectedAdmin(userId)) {
+    log("warn", "hard_reset_blocked_admin", { user_id: userId, request_id: req.id });
+    return res.status(403).json({ error: "admin_account_protected", request_id: req.id });
+  }
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -492,6 +519,7 @@ app.delete("/users/:userId/hard-reset", requireApiKey, requireRelaySignature, as
     await client.query(`DELETE FROM users WHERE user_id = $1::uuid`, [userId]);
     await client.query(`DELETE FROM user_identity_keys WHERE user_id = $1::uuid`, [userId]);
     await client.query(`DELETE FROM pad_batches WHERE owner_user_id = $1::uuid`, [userId]);
+    await client.query(`DELETE FROM user_badges WHERE user_id = $1::uuid`, [userId]);
     await client.query("COMMIT");
     return res.json({ status: "hard_reset_completed", request_id: req.id });
   } catch (e) {
@@ -502,6 +530,20 @@ app.delete("/users/:userId/hard-reset", requireApiKey, requireRelaySignature, as
     client.release();
   }
 });
+
+// --- Admin account protection: prevents deletion of admin accounts ---
+async function isProtectedAdmin(userId) {
+  try {
+    const result = await pool.query(
+      `SELECT username FROM users WHERE user_id = $1::uuid LIMIT 1`,
+      [userId]
+    );
+    if (result.rowCount === 0) return false;
+    return RELAY_ADMIN_USERNAMES.includes(result.rows[0].username?.toLowerCase());
+  } catch {
+    return false;
+  }
+}
 
 // --- Admin middleware: checks X-Admin-User-Id header against allowed usernames ---
 async function requireAdmin(req, res, next) {
@@ -608,6 +650,9 @@ app.delete("/badges/:userId", requireApiKey, requireRelaySignature, requireAdmin
   const { userId } = req.params;
   if (!UUID_RE.test(userId)) {
     return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
+  }
+  if (await isProtectedAdmin(userId)) {
+    return res.status(403).json({ error: "admin_badge_protected", request_id: req.id });
   }
   try {
     await pool.query(
