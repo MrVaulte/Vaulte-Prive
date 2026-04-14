@@ -204,6 +204,12 @@ function validateOpaqueCipherBase64(b64) {
   if (buf.length < MIN_CIPHERTEXT_BYTES) return "ciphertext_too_short";
   if (buf.length > MAX_CIPHERTEXT_BYTES) return "ciphertext_too_large";
 
+  // E2E+ envelope is JSON-wrapped AEAD payload encoded as base64.
+  // It is safe to bypass printable-ASCII heuristic when this strict shape matches.
+  if (looksLikeE2EPlusEnvelopeBytes(buf)) {
+    return null;
+  }
+
   if (buf.length >= 24) {
     let printable = 0;
     for (let i = 0; i < buf.length; i++) {
@@ -216,6 +222,24 @@ function validateOpaqueCipherBase64(b64) {
   }
 
   return null;
+}
+
+function looksLikeE2EPlusEnvelopeBytes(buf) {
+  try {
+    const text = buf.toString("utf8");
+    const obj = JSON.parse(text);
+    if (!obj || typeof obj !== "object") return false;
+    if (obj.version !== 1 || obj.mode !== "e2e_plus") return false;
+    if (typeof obj.nonceB64 !== "string") return false;
+    if (typeof obj.ciphertextB64 !== "string") return false;
+    if (typeof obj.tagB64 !== "string") return false;
+    const n = decodeStrictBase64(obj.nonceB64);
+    const c = decodeStrictBase64(obj.ciphertextB64);
+    const t = decodeStrictBase64(obj.tagB64);
+    return Boolean(n && c && t && n.length === 12 && t.length === 16 && c.length > 0);
+  } catch {
+    return false;
+  }
 }
 
 function validateMessageDTO(body) {
