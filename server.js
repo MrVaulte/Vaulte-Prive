@@ -701,7 +701,7 @@ app.get("/keys/:userId", requireApiKey, requireRelaySignature, async (req, res) 
   }
   try {
     const result = await pool.query(
-      `SELECT user_id, key_type, public_key_base64, updated_at
+      `SELECT user_id, key_type, public_key_base64, signing_public_key_base64, updated_at
        FROM user_identity_keys
        WHERE user_id = $1::uuid
        LIMIT 1`,
@@ -724,6 +724,7 @@ app.put("/keys/:userId", requireApiKey, requireRelaySignature, async (req, res) 
   }
   const keyType = String(req.body?.key_type || "").trim().toLowerCase();
   const publicKeyBase64 = req.body?.public_key_base64;
+  const signingKeyBase64 = req.body?.signing_public_key_base64 || null;
   if (keyType !== KEY_TYPE_X25519) {
     return res.status(400).json({ error: "invalid_key_type", request_id: req.id });
   }
@@ -732,14 +733,15 @@ app.put("/keys/:userId", requireApiKey, requireRelaySignature, async (req, res) 
   }
   try {
     const result = await pool.query(
-      `INSERT INTO user_identity_keys (user_id, key_type, public_key_base64, updated_at)
-       VALUES ($1::uuid, $2, $3, NOW())
+      `INSERT INTO user_identity_keys (user_id, key_type, public_key_base64, signing_public_key_base64, updated_at)
+       VALUES ($1::uuid, $2, $3, $4, NOW())
        ON CONFLICT (user_id) DO UPDATE
        SET key_type = EXCLUDED.key_type,
            public_key_base64 = EXCLUDED.public_key_base64,
+           signing_public_key_base64 = COALESCE(EXCLUDED.signing_public_key_base64, user_identity_keys.signing_public_key_base64),
            updated_at = NOW()
-       RETURNING user_id, key_type, public_key_base64, updated_at`,
-      [userId, keyType, publicKeyBase64]
+       RETURNING user_id, key_type, public_key_base64, signing_public_key_base64, updated_at`,
+      [userId, keyType, publicKeyBase64, signingKeyBase64]
     );
     return res.json(result.rows[0]);
   } catch (e) {
@@ -831,7 +833,7 @@ app.get("/keys/:userId/bundle", requireApiKey, requireRelaySignature, async (req
   }
   try {
     const identityResult = await pool.query(
-      `SELECT public_key_base64, key_type FROM user_identity_keys WHERE user_id = $1::uuid LIMIT 1`,
+      `SELECT public_key_base64, key_type, signing_public_key_base64 FROM user_identity_keys WHERE user_id = $1::uuid LIMIT 1`,
       [userId]
     );
     if (identityResult.rowCount === 0) {
@@ -860,6 +862,7 @@ app.get("/keys/:userId/bundle", requireApiKey, requireRelaySignature, async (req
     const bundle = {
       identity_key: identityResult.rows[0].public_key_base64,
       identity_key_type: identityResult.rows[0].key_type,
+      signing_public_key: identityResult.rows[0].signing_public_key_base64 || null,
     };
 
     if (spkResult.rowCount > 0) {
@@ -1315,6 +1318,9 @@ async function ensureIdentityKeysTable() {
   await pool.query(
     `CREATE INDEX IF NOT EXISTS idx_identity_keys_updated_at ON user_identity_keys (updated_at)`
   );
+  await pool.query(
+    `ALTER TABLE user_identity_keys ADD COLUMN IF NOT EXISTS signing_public_key_base64 TEXT`
+  ).catch(() => {});
 }
 
 async function ensurePrekeysTable() {
