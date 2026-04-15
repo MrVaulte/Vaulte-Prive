@@ -41,8 +41,8 @@ const pool = new Pool({
   ssl: process.env.PG_CA_CERT
     ? { ca: require("fs").readFileSync(process.env.PG_CA_CERT, "utf8") }
     : { rejectUnauthorized: false },
-  max: Number(process.env.PG_POOL_MAX || 20),
-  idleTimeoutMillis: Number(process.env.PG_IDLE_MS || 30_000),
+  max: Number(process.env.PG_POOL_MAX || 5),
+  idleTimeoutMillis: Number(process.env.PG_IDLE_MS || 10_000),
   connectionTimeoutMillis: Number(process.env.PG_CONNECT_TIMEOUT_MS || 10_000),
 });
 
