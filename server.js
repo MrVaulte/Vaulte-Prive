@@ -233,14 +233,33 @@ function looksLikeE2EPlusEnvelopeBytes(buf) {
     const text = buf.toString("utf8");
     const obj = JSON.parse(text);
     if (!obj || typeof obj !== "object") return false;
-    if (obj.version !== 1 || obj.mode !== "e2e_plus") return false;
-    if (typeof obj.nonceB64 !== "string") return false;
-    if (typeof obj.ciphertextB64 !== "string") return false;
-    if (typeof obj.tagB64 !== "string") return false;
-    const n = decodeStrictBase64(obj.nonceB64);
-    const c = decodeStrictBase64(obj.ciphertextB64);
-    const t = decodeStrictBase64(obj.tagB64);
-    return Boolean(n && c && t && n.length === 12 && t.length === 16 && c.length > 0);
+
+    // v1 e2e_plus envelope
+    if (obj.version === 1 && obj.mode === "e2e_plus") {
+      if (typeof obj.nonceB64 !== "string") return false;
+      if (typeof obj.ciphertextB64 !== "string") return false;
+      if (typeof obj.tagB64 !== "string") return false;
+      const n = decodeStrictBase64(obj.nonceB64);
+      const c = decodeStrictBase64(obj.ciphertextB64);
+      const t = decodeStrictBase64(obj.tagB64);
+      return Boolean(n && c && t && n.length === 12 && t.length === 16 && c.length > 0);
+    }
+
+    // v2 double-AEAD envelope
+    if (obj.version === 2 && obj.mode === "svr2_double_aead") {
+      return typeof obj.innerNonceB64 === "string" && typeof obj.outerNonceB64 === "string";
+    }
+
+    // v4 Double Ratchet envelope
+    if (obj.version === 4 && obj.mode === "dr_chacha_v1") {
+      if (typeof obj.nonceB64 !== "string") return false;
+      if (typeof obj.ciphertextB64 !== "string") return false;
+      if (typeof obj.tagB64 !== "string") return false;
+      if (!obj.header || typeof obj.header.publicKeyB64 !== "string") return false;
+      return true;
+    }
+
+    return false;
   } catch {
     return false;
   }
