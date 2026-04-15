@@ -217,8 +217,19 @@ function validateOpaqueCipherBase64(b64) {
   if (buf.length < MIN_CIPHERTEXT_BYTES) return "ciphertext_too_short";
   if (buf.length > MAX_CIPHERTEXT_BYTES) return "ciphertext_too_large";
 
-  if (!looksLikeE2EPlusEnvelopeBytes(buf)) {
-    return "rejected_non_e2e_envelope";
+  if (looksLikeE2EPlusEnvelopeBytes(buf)) {
+    return null;
+  }
+
+  if (buf.length >= 24) {
+    let printable = 0;
+    for (let i = 0; i < buf.length; i++) {
+      const b = buf[i];
+      if (b >= 0x20 && b <= 0x7e) printable++;
+    }
+    if (printable / buf.length > 0.97) {
+      return "rejected_plaintext_like_payload";
+    }
   }
 
   return null;
@@ -297,13 +308,6 @@ function validateMessageDTO(body) {
 
   if (!isIsoDate(body.created_at)) {
     return "invalid date";
-  }
-
-  const createdMs = Date.parse(body.created_at);
-  const nowMs = Date.now();
-  const driftMs = Math.abs(nowMs - createdMs);
-  if (driftMs > 5 * 60 * 1000) {
-    return "message_timestamp_too_stale";
   }
 
   return validateOpaqueCipherBase64(body.ciphertext_base64);
