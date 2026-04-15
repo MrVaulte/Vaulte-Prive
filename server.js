@@ -14,7 +14,7 @@ const http2 = require("http2");
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 
-const MIN_CIPHERTEXT_BYTES = 64;
+const MIN_CIPHERTEXT_BYTES = 1;
 const MAX_CIPHERTEXT_BYTES = 256 * 1024;
 const PAD_BATCH_DEFAULT_TTL_SEC = Number(process.env.PAD_BATCH_DEFAULT_TTL_SEC || 86400);
 const PAD_BATCH_MAX_PADS = Number(process.env.PAD_BATCH_MAX_PADS || 100);
@@ -241,33 +241,29 @@ function looksLikeE2EPlusEnvelopeBytes(buf) {
     const obj = JSON.parse(text);
     if (!obj || typeof obj !== "object") return false;
 
-    // Only accept v4 Double Ratchet envelopes (X25519-HKDF-ChaChaPoly)
-    if (obj.version !== 4 || obj.mode !== "dr_chacha_v1") return false;
+    // v1 e2e_plus envelope
+    if (obj.version === 1 && obj.mode === "e2e_plus") {
+      if (typeof obj.nonceB64 !== "string") return false;
+      if (typeof obj.ciphertextB64 !== "string") return false;
+      if (typeof obj.tagB64 !== "string") return false;
+      return true;
+    }
 
-    if (typeof obj.nonceB64 !== "string") return false;
-    if (typeof obj.ciphertextB64 !== "string") return false;
-    if (typeof obj.tagB64 !== "string") return false;
-    if (typeof obj.senderIdentityHashB64 !== "string") return false;
-    if (!obj.header || typeof obj.header !== "object") return false;
-    if (typeof obj.header.publicKeyB64 !== "string") return false;
-    if (typeof obj.header.messageNumber !== "number") return false;
-    if (typeof obj.header.previousChainLength !== "number") return false;
+    // v2 double-AEAD envelope
+    if (obj.version === 2 && obj.mode === "svr2_double_aead") {
+      return typeof obj.innerNonceB64 === "string" && typeof obj.outerNonceB64 === "string";
+    }
 
-    const nonce = decodeStrictBase64(obj.nonceB64);
-    const ct = decodeStrictBase64(obj.ciphertextB64);
-    const tag = decodeStrictBase64(obj.tagB64);
-    const idHash = decodeStrictBase64(obj.senderIdentityHashB64);
-    const ratchetPub = decodeStrictBase64(obj.header.publicKeyB64);
+    // v4 Double Ratchet envelope
+    if (obj.version === 4 && obj.mode === "dr_chacha_v1") {
+      if (typeof obj.nonceB64 !== "string") return false;
+      if (typeof obj.ciphertextB64 !== "string") return false;
+      if (typeof obj.tagB64 !== "string") return false;
+      if (!obj.header || typeof obj.header.publicKeyB64 !== "string") return false;
+      return true;
+    }
 
-    if (!nonce || nonce.length !== 12) return false;
-    if (!ct || ct.length < 1) return false;
-    if (!tag || tag.length !== 16) return false;
-    if (!idHash || idHash.length !== 32) return false;
-    if (!ratchetPub || ratchetPub.length !== 32) return false;
-
-    if (obj.cipherSuite && obj.cipherSuite !== "X25519-HKDF-ChaChaPoly-v1") return false;
-
-    return true;
+    return false;
   } catch {
     return false;
   }
@@ -792,8 +788,7 @@ app.put("/keys/:userId/signed-prekey", requireApiKey, requireRelaySignature, asy
   if (!validatePublicKeyBase64(publicKeyBase64)) {
     return res.status(400).json({ error: "invalid_public_key", request_id: req.id });
   }
-  const sigBytes = decodeStrictBase64(signatureBase64);
-  if (!sigBytes || sigBytes.length !== 64) {
+  if (typeof signatureBase64 !== "string" || signatureBase64.length < 10 || signatureBase64.length > 200) {
     return res.status(400).json({ error: "invalid_signature", request_id: req.id });
   }
   try {
@@ -835,19 +830,20 @@ app.get("/keys/:userId/bundle", requireApiKey, requireRelaySignature, async (req
       [userId]
     );
 
-    if (spkResult.rowCount === 0) {
-      return res.status(404).json({ error: "no_signed_prekey", request_id: req.id });
-    }
-
-    return res.json({
+    const bundle = {
       identity_key: identityResult.rows[0].public_key_base64,
       identity_key_type: identityResult.rows[0].key_type,
-      signed_prekey: {
+    };
+
+    if (spkResult.rowCount > 0) {
+      bundle.signed_prekey = {
         key_id: spkResult.rows[0].key_id,
         public_key_base64: spkResult.rows[0].public_key_base64,
         signature_base64: spkResult.rows[0].signature_base64,
-      },
-    });
+      };
+    }
+
+    return res.json(bundle);
   } catch (e) {
     log("error", "get_prekey_bundle_db", { message: e.message, request_id: req.id });
     return res.status(500).json({ error: "db_error", request_id: req.id });
