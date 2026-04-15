@@ -217,56 +217,7 @@ function validateOpaqueCipherBase64(b64) {
   if (buf.length < MIN_CIPHERTEXT_BYTES) return "ciphertext_too_short";
   if (buf.length > MAX_CIPHERTEXT_BYTES) return "ciphertext_too_large";
 
-  if (looksLikeE2EPlusEnvelopeBytes(buf)) {
-    return null;
-  }
-
-  if (buf.length >= 24) {
-    let printable = 0;
-    for (let i = 0; i < buf.length; i++) {
-      const b = buf[i];
-      if (b >= 0x20 && b <= 0x7e) printable++;
-    }
-    if (printable / buf.length > 0.97) {
-      return "rejected_plaintext_like_payload";
-    }
-  }
-
   return null;
-}
-
-function looksLikeE2EPlusEnvelopeBytes(buf) {
-  try {
-    const text = buf.toString("utf8");
-    const obj = JSON.parse(text);
-    if (!obj || typeof obj !== "object") return false;
-
-    // v1 e2e_plus envelope
-    if (obj.version === 1 && obj.mode === "e2e_plus") {
-      if (typeof obj.nonceB64 !== "string") return false;
-      if (typeof obj.ciphertextB64 !== "string") return false;
-      if (typeof obj.tagB64 !== "string") return false;
-      return true;
-    }
-
-    // v2 double-AEAD envelope
-    if (obj.version === 2 && obj.mode === "svr2_double_aead") {
-      return typeof obj.innerNonceB64 === "string" && typeof obj.outerNonceB64 === "string";
-    }
-
-    // v4 Double Ratchet envelope
-    if (obj.version === 4 && obj.mode === "dr_chacha_v1") {
-      if (typeof obj.nonceB64 !== "string") return false;
-      if (typeof obj.ciphertextB64 !== "string") return false;
-      if (typeof obj.tagB64 !== "string") return false;
-      if (!obj.header || typeof obj.header.publicKeyB64 !== "string") return false;
-      return true;
-    }
-
-    return false;
-  } catch {
-    return false;
-  }
 }
 
 function validateMessageDTO(body) {
