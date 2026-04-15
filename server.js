@@ -568,7 +568,6 @@ app.delete("/users/:userId/hard-reset", requireApiKey, requireRelaySignature, as
     await client.query(`DELETE FROM users WHERE user_id = $1::uuid`, [userId]);
     await client.query(`DELETE FROM user_identity_keys WHERE user_id = $1::uuid`, [userId]);
     await client.query(`DELETE FROM signed_prekeys WHERE user_id = $1::uuid`, [userId]);
-    await client.query(`DELETE FROM one_time_prekeys WHERE user_id = $1::uuid`, [userId]);
     await client.query(`DELETE FROM pad_batches WHERE owner_user_id = $1::uuid`, [userId]);
     await client.query(`DELETE FROM user_badges WHERE user_id = $1::uuid`, [userId]);
     await client.query("COMMIT");
@@ -811,45 +810,7 @@ app.put("/keys/:userId/signed-prekey", requireApiKey, requireRelaySignature, asy
   }
 });
 
-// POST /keys/:userId/one-time-prekeys — upload batch of one-time prekeys
-app.post("/keys/:userId/one-time-prekeys", requireApiKey, requireRelaySignature, async (req, res) => {
-  const { userId } = req.params;
-  if (!UUID_RE.test(userId)) {
-    return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
-  }
-  const keys = req.body?.keys;
-  if (!Array.isArray(keys) || keys.length === 0 || keys.length > 100) {
-    return res.status(400).json({ error: "invalid_keys_array", request_id: req.id });
-  }
-  try {
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      for (const k of keys) {
-        const kid = Number(k.key_id);
-        if (!Number.isInteger(kid) || kid < 0 || !validatePublicKeyBase64(k.public_key_base64)) continue;
-        await client.query(
-          `INSERT INTO one_time_prekeys (user_id, key_id, public_key_base64, uploaded_at)
-           VALUES ($1::uuid, $2, $3, NOW())
-           ON CONFLICT (user_id, key_id) DO NOTHING`,
-          [userId, kid, k.public_key_base64]
-        );
-      }
-      await client.query("COMMIT");
-    } catch (e) {
-      await client.query("ROLLBACK");
-      throw e;
-    } finally {
-      client.release();
-    }
-    return res.json({ ok: true, uploaded: keys.length });
-  } catch (e) {
-    log("error", "post_one_time_prekeys_db", { message: e.message, request_id: req.id });
-    return res.status(500).json({ error: "db_error", request_id: req.id });
-  }
-});
-
-// GET /keys/:userId/bundle — fetch prekey bundle (identity + signed prekey + one OT prekey consumed)
+// GET /keys/:userId/bundle — fetch prekey bundle (identity + signed prekey)
 app.get("/keys/:userId/bundle", requireApiKey, requireRelaySignature, async (req, res) => {
   const { userId } = req.params;
   if (!UUID_RE.test(userId)) {
@@ -871,18 +832,6 @@ app.get("/keys/:userId/bundle", requireApiKey, requireRelaySignature, async (req
       [userId]
     );
 
-    // Atomically consume one one-time prekey (DELETE RETURNING)
-    const otpResult = await pool.query(
-      `DELETE FROM one_time_prekeys
-       WHERE id = (
-         SELECT id FROM one_time_prekeys
-         WHERE user_id = $1::uuid
-         ORDER BY key_id ASC LIMIT 1
-       )
-       RETURNING key_id, public_key_base64`,
-      [userId]
-    );
-
     const bundle = {
       identity_key: identityResult.rows[0].public_key_base64,
       identity_key_type: identityResult.rows[0].key_type,
@@ -896,33 +845,9 @@ app.get("/keys/:userId/bundle", requireApiKey, requireRelaySignature, async (req
       };
     }
 
-    if (otpResult.rowCount > 0) {
-      bundle.one_time_prekey = {
-        key_id: otpResult.rows[0].key_id,
-        public_key_base64: otpResult.rows[0].public_key_base64,
-      };
-    }
-
     return res.json(bundle);
   } catch (e) {
     log("error", "get_prekey_bundle_db", { message: e.message, request_id: req.id });
-    return res.status(500).json({ error: "db_error", request_id: req.id });
-  }
-});
-
-// GET /keys/:userId/one-time-prekeys/count — check remaining OT prekeys
-app.get("/keys/:userId/one-time-prekeys/count", requireApiKey, requireRelaySignature, async (req, res) => {
-  const { userId } = req.params;
-  if (!UUID_RE.test(userId)) {
-    return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
-  }
-  try {
-    const result = await pool.query(
-      `SELECT COUNT(*)::int AS count FROM one_time_prekeys WHERE user_id = $1::uuid`,
-      [userId]
-    );
-    return res.json({ count: result.rows[0].count });
-  } catch (e) {
     return res.status(500).json({ error: "db_error", request_id: req.id });
   }
 });
@@ -1363,19 +1288,6 @@ async function ensurePrekeysTable() {
       uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       PRIMARY KEY (user_id, key_id)
     )`
-  );
-  await pool.query(
-    `CREATE TABLE IF NOT EXISTS one_time_prekeys (
-      id SERIAL PRIMARY KEY,
-      user_id UUID NOT NULL,
-      key_id INTEGER NOT NULL,
-      public_key_base64 TEXT NOT NULL,
-      uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      UNIQUE (user_id, key_id)
-    )`
-  );
-  await pool.query(
-    `CREATE INDEX IF NOT EXISTS idx_otp_prekeys_user ON one_time_prekeys (user_id)`
   );
 }
 
