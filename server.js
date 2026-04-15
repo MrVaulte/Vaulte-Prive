@@ -8,8 +8,6 @@ const cors = require("cors");
 const { Pool } = require("pg");
 const rateLimit = require("express-rate-limit");
 const crypto = require("crypto");
-const fs = require("fs");
-const http2 = require("http2");
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -41,8 +39,8 @@ const pool = new Pool({
   ssl: process.env.PG_CA_CERT
     ? { ca: require("fs").readFileSync(process.env.PG_CA_CERT, "utf8") }
     : { rejectUnauthorized: false },
-  max: Number(process.env.PG_POOL_MAX || 5),
-  idleTimeoutMillis: Number(process.env.PG_IDLE_MS || 10_000),
+  max: Number(process.env.PG_POOL_MAX || 20),
+  idleTimeoutMillis: Number(process.env.PG_IDLE_MS || 30_000),
   connectionTimeoutMillis: Number(process.env.PG_CONNECT_TIMEOUT_MS || 10_000),
 });
 
@@ -61,9 +59,6 @@ app.use((req, res, next) => {
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "no-referrer");
   res.setHeader("Permissions-Policy", "interest-cohort=()");
-  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
-  res.setHeader("Pragma", "no-cache");
-  res.setHeader("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload");
   next();
 });
 
@@ -217,7 +212,61 @@ function validateOpaqueCipherBase64(b64) {
   if (buf.length < MIN_CIPHERTEXT_BYTES) return "ciphertext_too_short";
   if (buf.length > MAX_CIPHERTEXT_BYTES) return "ciphertext_too_large";
 
+  // E2E+ envelope is JSON-wrapped AEAD payload encoded as base64.
+  // It is safe to bypass printable-ASCII heuristic when this strict shape matches.
+  if (looksLikeE2EPlusEnvelopeBytes(buf)) {
+    return null;
+  }
+
+  if (buf.length >= 24) {
+    let printable = 0;
+    for (let i = 0; i < buf.length; i++) {
+      const b = buf[i];
+      if (b >= 0x20 && b <= 0x7e) printable++;
+    }
+    if (printable / buf.length > 0.97) {
+      return "rejected_plaintext_like_payload";
+    }
+  }
+
   return null;
+}
+
+function looksLikeE2EPlusEnvelopeBytes(buf) {
+  try {
+    const text = buf.toString("utf8");
+    const obj = JSON.parse(text);
+    if (!obj || typeof obj !== "object") return false;
+
+    // v1 e2e_plus envelope
+    if (obj.version === 1 && obj.mode === "e2e_plus") {
+      if (typeof obj.nonceB64 !== "string") return false;
+      if (typeof obj.ciphertextB64 !== "string") return false;
+      if (typeof obj.tagB64 !== "string") return false;
+      const n = decodeStrictBase64(obj.nonceB64);
+      const c = decodeStrictBase64(obj.ciphertextB64);
+      const t = decodeStrictBase64(obj.tagB64);
+      return Boolean(n && c && t && n.length === 12 && t.length === 16 && c.length > 0);
+    }
+
+    // v2 double-AEAD envelope
+    if (obj.version === 2 && obj.mode === "svr2_double_aead") {
+      return typeof obj.innerNonceB64 === "string" && typeof obj.outerNonceB64 === "string";
+    }
+
+    // v4 Double Ratchet envelope
+    if (obj.version === 4 && obj.mode === "dr_chacha_v1") {
+      if (typeof obj.nonceB64 !== "string") return false;
+      if (typeof obj.ciphertextB64 !== "string") return false;
+      if (typeof obj.tagB64 !== "string") return false;
+      if (!obj.header || typeof obj.header.publicKeyB64 !== "string") return false;
+      return true;
+    }
+
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 function validateMessageDTO(body) {
@@ -477,29 +526,6 @@ app.put("/users/:userId", requireApiKey, requireRelaySignature, async (req, res)
   }
 });
 
-app.put("/users/:userId/voip-push-token", requireApiKey, requireRelaySignature, async (req, res) => {
-  const { userId } = req.params;
-  if (!UUID_RE.test(userId)) {
-    return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
-  }
-  const raw = typeof req.body?.push_token === "string" ? req.body.push_token.trim().replace(/\s+/g, "") : "";
-  if (!/^[0-9a-f]{40,1024}$/i.test(raw)) {
-    return res.status(400).json({ error: "invalid_push_token", request_id: req.id });
-  }
-  try {
-    await pool.query(
-      `INSERT INTO user_voip_push_tokens (user_id, push_token_hex, updated_at)
-       VALUES ($1::uuid, $2::text, NOW())
-       ON CONFLICT (user_id) DO UPDATE SET push_token_hex = EXCLUDED.push_token_hex, updated_at = NOW()`,
-      [userId, raw.toLowerCase()]
-    );
-    return res.json({ ok: true });
-  } catch (e) {
-    log("error", "voip_token_db", { message: e.message, request_id: req.id });
-    return res.status(500).json({ error: "db_error", request_id: req.id });
-  }
-});
-
 app.delete("/users/:userId/hard-reset", requireApiKey, requireRelaySignature, async (req, res) => {
   const { userId } = req.params;
   if (!UUID_RE.test(userId)) {
@@ -513,10 +539,10 @@ app.delete("/users/:userId/hard-reset", requireApiKey, requireRelaySignature, as
   try {
     await client.query("BEGIN");
     await client.query(`DELETE FROM messages WHERE sender_id = $1::uuid OR recipient_id = $1::uuid`, [userId]);
-    await client.query(`DELETE FROM user_voip_push_tokens WHERE user_id = $1::uuid`, [userId]);
     await client.query(`DELETE FROM users WHERE user_id = $1::uuid`, [userId]);
     await client.query(`DELETE FROM user_identity_keys WHERE user_id = $1::uuid`, [userId]);
     await client.query(`DELETE FROM signed_prekeys WHERE user_id = $1::uuid`, [userId]);
+    await client.query(`DELETE FROM one_time_prekeys WHERE user_id = $1::uuid`, [userId]);
     await client.query(`DELETE FROM pad_batches WHERE owner_user_id = $1::uuid`, [userId]);
     await client.query(`DELETE FROM user_badges WHERE user_id = $1::uuid`, [userId]);
     await client.query("COMMIT");
@@ -759,7 +785,45 @@ app.put("/keys/:userId/signed-prekey", requireApiKey, requireRelaySignature, asy
   }
 });
 
-// GET /keys/:userId/bundle — fetch prekey bundle (identity + signed prekey)
+// POST /keys/:userId/one-time-prekeys — upload batch of one-time prekeys
+app.post("/keys/:userId/one-time-prekeys", requireApiKey, requireRelaySignature, async (req, res) => {
+  const { userId } = req.params;
+  if (!UUID_RE.test(userId)) {
+    return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
+  }
+  const keys = req.body?.keys;
+  if (!Array.isArray(keys) || keys.length === 0 || keys.length > 100) {
+    return res.status(400).json({ error: "invalid_keys_array", request_id: req.id });
+  }
+  try {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      for (const k of keys) {
+        const kid = Number(k.key_id);
+        if (!Number.isInteger(kid) || kid < 0 || !validatePublicKeyBase64(k.public_key_base64)) continue;
+        await client.query(
+          `INSERT INTO one_time_prekeys (user_id, key_id, public_key_base64, uploaded_at)
+           VALUES ($1::uuid, $2, $3, NOW())
+           ON CONFLICT (user_id, key_id) DO NOTHING`,
+          [userId, kid, k.public_key_base64]
+        );
+      }
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
+    }
+    return res.json({ ok: true, uploaded: keys.length });
+  } catch (e) {
+    log("error", "post_one_time_prekeys_db", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
+  }
+});
+
+// GET /keys/:userId/bundle — fetch prekey bundle (identity + signed prekey + one OT prekey consumed)
 app.get("/keys/:userId/bundle", requireApiKey, requireRelaySignature, async (req, res) => {
   const { userId } = req.params;
   if (!UUID_RE.test(userId)) {
@@ -781,6 +845,18 @@ app.get("/keys/:userId/bundle", requireApiKey, requireRelaySignature, async (req
       [userId]
     );
 
+    // Atomically consume one one-time prekey (DELETE RETURNING)
+    const otpResult = await pool.query(
+      `DELETE FROM one_time_prekeys
+       WHERE id = (
+         SELECT id FROM one_time_prekeys
+         WHERE user_id = $1::uuid
+         ORDER BY key_id ASC LIMIT 1
+       )
+       RETURNING key_id, public_key_base64`,
+      [userId]
+    );
+
     const bundle = {
       identity_key: identityResult.rows[0].public_key_base64,
       identity_key_type: identityResult.rows[0].key_type,
@@ -794,9 +870,33 @@ app.get("/keys/:userId/bundle", requireApiKey, requireRelaySignature, async (req
       };
     }
 
+    if (otpResult.rowCount > 0) {
+      bundle.one_time_prekey = {
+        key_id: otpResult.rows[0].key_id,
+        public_key_base64: otpResult.rows[0].public_key_base64,
+      };
+    }
+
     return res.json(bundle);
   } catch (e) {
     log("error", "get_prekey_bundle_db", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
+  }
+});
+
+// GET /keys/:userId/one-time-prekeys/count — check remaining OT prekeys
+app.get("/keys/:userId/one-time-prekeys/count", requireApiKey, requireRelaySignature, async (req, res) => {
+  const { userId } = req.params;
+  if (!UUID_RE.test(userId)) {
+    return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
+  }
+  try {
+    const result = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM one_time_prekeys WHERE user_id = $1::uuid`,
+      [userId]
+    );
+    return res.json({ count: result.rows[0].count });
+  } catch (e) {
     return res.status(500).json({ error: "db_error", request_id: req.id });
   }
 });
@@ -1217,16 +1317,6 @@ async function ensureIdentityKeysTable() {
   );
 }
 
-async function ensureVoipPushTokensTable() {
-  await pool.query(
-    `CREATE TABLE IF NOT EXISTS user_voip_push_tokens (
-      user_id UUID PRIMARY KEY,
-      push_token_hex TEXT NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )`
-  );
-}
-
 async function ensurePrekeysTable() {
   await pool.query(
     `CREATE TABLE IF NOT EXISTS signed_prekeys (
@@ -1237,6 +1327,19 @@ async function ensurePrekeysTable() {
       uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       PRIMARY KEY (user_id, key_id)
     )`
+  );
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS one_time_prekeys (
+      id SERIAL PRIMARY KEY,
+      user_id UUID NOT NULL,
+      key_id INTEGER NOT NULL,
+      public_key_base64 TEXT NOT NULL,
+      uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (user_id, key_id)
+    )`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_otp_prekeys_user ON one_time_prekeys (user_id)`
   );
 }
 
@@ -1390,138 +1493,6 @@ function stripAuthFields(obj) {
   return clean;
 }
 
-// ── VoIP Push (APNs) for offline incoming calls ─────────────────────────
-
-function b64urlJson(obj) {
-  return Buffer.from(JSON.stringify(obj))
-    .toString("base64")
-    .replace(/=/g, "")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_");
-}
-
-function b64urlBuf(buf) {
-  return Buffer.from(buf)
-    .toString("base64")
-    .replace(/=/g, "")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_");
-}
-
-function createApnsJwtEs256(teamId, keyId, privateKeyPem) {
-  const header = { alg: "ES256", kid: keyId, typ: "JWT" };
-  const now = Math.floor(Date.now() / 1000);
-  const claims = { iss: teamId, iat: now };
-  const unsigned = `${b64urlJson(header)}.${b64urlJson(claims)}`;
-  const key = crypto.createPrivateKey(privateKeyPem);
-  const sig = crypto.sign("sha256", Buffer.from(unsigned), { key, dsaEncoding: "ieee-p1363" });
-  return `${unsigned}.${b64urlBuf(sig)}`;
-}
-
-let apnsJwtCache = { token: null, expiresAtMs: 0 };
-
-function getApnsJwt() {
-  const teamId = process.env.APNS_TEAM_ID?.trim();
-  const keyId = process.env.APNS_KEY_ID?.trim();
-  let keyPem = process.env.APNS_AUTH_KEY?.trim();
-  const keyPath = process.env.APNS_AUTH_KEY_PATH?.trim();
-  if (!keyPem && keyPath) {
-    try {
-      keyPem = fs.readFileSync(keyPath, "utf8");
-    } catch {
-      return null;
-    }
-  }
-  if (!teamId || !keyId || !keyPem) return null;
-  const now = Date.now();
-  if (apnsJwtCache.token && now < apnsJwtCache.expiresAtMs - 60_000) {
-    return apnsJwtCache.token;
-  }
-  try {
-    const jwt = createApnsJwtEs256(teamId, keyId, keyPem);
-    apnsJwtCache = { token: jwt, expiresAtMs: now + 50 * 60 * 1000 };
-    return jwt;
-  } catch (e) {
-    log("error", "apns_jwt_failed", { message: e.message });
-    return null;
-  }
-}
-
-function sendVoipPushHttp2({ jwt, deviceHex, topic, bodyObj }) {
-  return new Promise((resolve) => {
-    const host =
-      process.env.APNS_USE_SANDBOX === "1" || process.env.APNS_USE_SANDBOX === "true"
-        ? "api.sandbox.push.apple.com"
-        : "api.push.apple.com";
-    const client = http2.connect(`https://${host}`, { timeout: 20_000 });
-    const tidy = () => {
-      try {
-        client.close();
-      } catch {
-        /* ignore */
-      }
-    };
-    client.on("error", (err) => {
-      tidy();
-      resolve({ ok: false, status: 0, error: err.message });
-    });
-    const body = JSON.stringify(bodyObj);
-    const path = `/3/device/${deviceHex}`;
-    const req = client.request({
-      ":method": "POST",
-      ":path": path,
-      "apns-topic": topic,
-      "apns-push-type": "voip",
-      "apns-priority": "10",
-      authorization: `bearer ${jwt}`,
-      "content-type": "application/json",
-      "content-length": String(Buffer.byteLength(body)),
-    });
-    let status = 0;
-    const chunks = [];
-    req.setEncoding("utf8");
-    req.on("response", (headers) => {
-      status = Number(headers[":status"] || 0);
-    });
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => {
-      tidy();
-      resolve({ ok: status >= 200 && status < 300, status, body: chunks.join("") });
-    });
-    req.on("error", (e) => {
-      tidy();
-      resolve({ ok: false, status, error: e.message });
-    });
-    req.write(body);
-    req.end();
-  });
-}
-
-async function tryDeliverCallOfferViaVoip(targetUserId, forwarded) {
-  const jwt = getApnsJwt();
-  if (!jwt) return false;
-  let rows;
-  try {
-    const r = await pool.query(
-      `SELECT push_token_hex FROM user_voip_push_tokens WHERE user_id = $1::uuid LIMIT 1`,
-      [targetUserId]
-    );
-    rows = r.rows;
-  } catch {
-    return false;
-  }
-  if (!rows.length) return false;
-  const deviceHex = rows[0].push_token_hex;
-  const topic = process.env.APNS_VOIP_TOPIC?.trim() || "Vaulte-.Vaulte--Prive-.voip";
-  const bodyObj = {
-    aps: { "content-available": 1 },
-    vaulte: forwarded,
-  };
-  const result = await sendVoipPushHttp2({ jwt, deviceHex, topic, bodyObj });
-  log("info", "voip_push_attempt", { targetUserId, ok: result.ok, status: result.status });
-  return Boolean(result.ok);
-}
-
 function handleSignaling(ws, msg, fromUserId) {
   const { type, callId, targetUserId } = msg;
   if (!targetUserId || !fromUserId) return;
@@ -1535,23 +1506,13 @@ function handleSignaling(ws, msg, fromUserId) {
     case "call_ice": {
       const delivered = wsSendTo(targetUserId, forwarded);
       if (type === "call_offer" && !delivered) {
-        void (async () => {
-          let recovered = false;
-          try {
-            recovered = await tryDeliverCallOfferViaVoip(targetUserId, forwarded);
-          } catch (e) {
-            log("warn", "voip_notify_error", { message: e.message, targetUserId });
-          }
-          if (!recovered && ws.readyState === WebSocket.OPEN) {
-            const reject = JSON.stringify({
-              type: "call_unavailable",
-              callId,
-              targetUserId,
-              reason: "offline",
-            });
-            ws.send(reject);
-          }
-        })();
+        const reject = JSON.stringify({
+          type: "call_unavailable",
+          callId,
+          targetUserId,
+          reason: "offline",
+        });
+        if (ws.readyState === WebSocket.OPEN) ws.send(reject);
       }
       break;
     }
@@ -1685,7 +1646,6 @@ async function bootstrap() {
   await ensurePadBatchesTable();
   await ensureIdentityKeysTable();
   await ensurePrekeysTable();
-  await ensureVoipPushTokensTable();
   await sweepExpiredPadBatches();
   setInterval(sweepExpiredPadBatches, PAD_BATCH_SWEEP_INTERVAL_SEC * 1000).unref();
   server = app.listen(PORT, () => {
@@ -1720,4 +1680,3 @@ function shutdown(signal) {
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
-
