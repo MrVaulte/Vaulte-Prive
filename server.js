@@ -36,7 +36,9 @@ app.set("trust proxy", Number(process.env.TRUST_PROXY_HOPS || 1));
 // --- PostgreSQL pool (Supabase) ---
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: process.env.PG_CA_CERT
+    ? { ca: require("fs").readFileSync(process.env.PG_CA_CERT, "utf8") }
+    : { rejectUnauthorized: process.env.NODE_ENV === "production" },
   max: Number(process.env.PG_POOL_MAX || 20),
   idleTimeoutMillis: Number(process.env.PG_IDLE_MS || 30_000),
   connectionTimeoutMillis: Number(process.env.PG_CONNECT_TIMEOUT_MS || 10_000),
@@ -89,7 +91,9 @@ function requireApiKey(req, res, next) {
       ? h.slice(7).trim()
       : null;
   const token = bearer || (typeof x === "string" ? x.trim() : "");
-  if (token !== RELAY_API_KEY) {
+  const tokenBuf = Buffer.from(token);
+  const keyBuf = Buffer.from(RELAY_API_KEY);
+  if (tokenBuf.length !== keyBuf.length || !crypto.timingSafeEqual(tokenBuf, keyBuf)) {
     return res.status(401).json({ error: "unauthorized", request_id: req.id });
   }
   next();
@@ -582,6 +586,8 @@ async function requireAdmin(req, res, next) {
     if (!RELAY_ADMIN_USERNAMES.includes(username)) {
       return res.status(403).json({ error: "forbidden", request_id: req.id });
     }
+    req.adminUserId = adminUserId;
+    req.adminUsername = username;
     next();
   } catch (e) {
     log("error", "admin_check_failed", { message: e.message, request_id: req.id });
@@ -644,7 +650,7 @@ app.put("/badges/:userId", requireApiKey, requireRelaySignature, requireAdmin, a
   if (!["official", "verified"].includes(badgeType)) {
     return res.status(400).json({ error: "invalid_badge_type", valid: ["official", "verified"], request_id: req.id });
   }
-  const grantedBy = req.body?.granted_by || "admin";
+  const grantedBy = req.adminUsername || "admin";
   try {
     const result = await pool.query(
       `INSERT INTO user_badges (user_id, badge_type, granted_by, granted_at)
@@ -1407,10 +1413,22 @@ function setupWebSocket(httpServer) {
         return;
       }
 
-      // ── Track / clear call peer ──
+      // ── ACL for call_answer ──
       if (msg.type === "call_answer") {
-        callPeerId = msg.targetUserId || null;
-      } else if (msg.type === "call_end" || msg.type === "call_decline") {
+        const target = msg.targetUserId;
+        const convId = msg.conversationId;
+        verifyConversationAccess(registeredUserId, target, convId).then((allowed) => {
+          if (!allowed) {
+            ws.send(JSON.stringify({ type: "error", message: "no_conversation" }));
+            return;
+          }
+          callPeerId = target || null;
+          handleSignaling(ws, { ...msg, fromUserId: registeredUserId }, registeredUserId);
+        });
+        return;
+      }
+
+      if (msg.type === "call_end" || msg.type === "call_decline") {
         callPeerId = null;
       }
 
