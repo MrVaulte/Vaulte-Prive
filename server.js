@@ -462,9 +462,32 @@ app.put("/users/:userId", requireApiKey, requireRelaySignature, async (req, res)
   if (!UUID_RE.test(userId)) {
     return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
   }
-  const normalized = normalizeUsername(req.body?.username);
+
+  let existingRow;
+  try {
+    const r = await pool.query(
+      `SELECT username FROM users WHERE user_id = $1::uuid LIMIT 1`,
+      [userId]
+    );
+    existingRow = r.rows[0];
+  } catch (e) {
+    log("error", "put_user_prefetch", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
+  }
+
+  // Body may omit username (avatar-only clients); reuse row from DB when present.
+  let normalized = normalizeUsername(req.body?.username);
+  if (!normalized && existingRow?.username) {
+    normalized = normalizeUsername(existingRow.username);
+  }
   if (!normalized) {
     return res.status(400).json({ error: "invalid_username", request_id: req.id });
+  }
+
+  // Reserved admin handles: always use the stored login so PUT for avatar/display_name cannot 403 on draft mismatch.
+  if (existingRow?.username && RELAY_ADMIN_USERNAMES.includes(String(existingRow.username).toLowerCase())) {
+    const lockedNorm = normalizeUsername(existingRow.username);
+    if (lockedNorm) normalized = lockedNorm;
   }
 
   // Block non-admins from taking a reserved admin username
@@ -475,17 +498,6 @@ app.put("/users/:userId", requireApiKey, requireRelaySignature, async (req, res)
     );
     if (existing.rowCount > 0 && existing.rows[0].user_id !== userId) {
       return res.status(403).json({ error: "admin_username_reserved", request_id: req.id });
-    }
-  }
-
-  // Block renaming an admin account to a different username
-  if (await isProtectedAdmin(userId)) {
-    const current = await pool.query(
-      `SELECT username FROM users WHERE user_id = $1::uuid LIMIT 1`,
-      [userId]
-    );
-    if (current.rowCount > 0 && current.rows[0].username?.toLowerCase() !== normalized.toLowerCase()) {
-      return res.status(403).json({ error: "admin_username_locked", request_id: req.id });
     }
   }
 
