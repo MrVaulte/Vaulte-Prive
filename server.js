@@ -394,7 +394,7 @@ app.get("/users/resolve", requireApiKey, requireRelaySignature, async (req, res)
   }
   try {
     const result = await pool.query(
-      `SELECT user_id, username, updated_at
+      `SELECT user_id, username, display_name, avatar_b64, updated_at
        FROM users
        WHERE username = $1
        LIMIT 1`,
@@ -420,7 +420,7 @@ app.get("/users/search", requireApiKey, requireRelaySignature, async (req, res) 
   const limit = Math.min(Math.max(Number.isFinite(n) ? Math.floor(n) : 20, 1), 50);
   try {
     const result = await pool.query(
-      `SELECT user_id, username, updated_at
+      `SELECT user_id, username, display_name, avatar_b64, updated_at
        FROM users
        WHERE username LIKE $1
        ORDER BY username ASC
@@ -441,7 +441,7 @@ app.get("/users/:userId", requireApiKey, requireRelaySignature, async (req, res)
   }
   try {
     const result = await pool.query(
-      `SELECT user_id, username, updated_at
+      `SELECT user_id, username, display_name, avatar_b64, updated_at
        FROM users
        WHERE user_id = $1::uuid
        LIMIT 1`,
@@ -489,14 +489,37 @@ app.put("/users/:userId", requireApiKey, requireRelaySignature, async (req, res)
     }
   }
 
+  const displayName = (typeof req.body?.display_name === "string"
+    ? req.body.display_name.trim().slice(0, 64)
+    : null) || null;
+
+  const avatarInBody = req.body && Object.prototype.hasOwnProperty.call(req.body, "avatar_b64");
+  let avatarParam = null;
+  if (avatarInBody) {
+    const raw = req.body.avatar_b64;
+    if (typeof raw !== "string") {
+      return res.status(400).json({ error: "invalid_avatar_b64", request_id: req.id });
+    }
+    const trimmed = raw.trim();
+    const MAX_AVATAR_B64 = 600_000;
+    if (trimmed.length > MAX_AVATAR_B64) {
+      return res.status(400).json({ error: "avatar_too_large", request_id: req.id });
+    }
+    avatarParam = trimmed.length ? trimmed : null;
+  }
+  const insertAvatar = avatarInBody ? avatarParam : null;
+
   try {
     const result = await pool.query(
-      `INSERT INTO users (user_id, username, updated_at)
-       VALUES ($1::uuid, $2, NOW())
+      `INSERT INTO users (user_id, username, display_name, avatar_b64, updated_at)
+       VALUES ($1::uuid, $2, $3, $4, NOW())
        ON CONFLICT (user_id) DO UPDATE
-       SET username = EXCLUDED.username, updated_at = NOW()
-       RETURNING user_id, username, updated_at`,
-      [userId, normalized]
+       SET username = EXCLUDED.username,
+           display_name = COALESCE(EXCLUDED.display_name, users.display_name),
+           avatar_b64 = CASE WHEN $5::boolean THEN EXCLUDED.avatar_b64 ELSE users.avatar_b64 END,
+           updated_at = NOW()
+       RETURNING user_id, username, display_name, avatar_b64, updated_at`,
+      [userId, normalized, displayName, insertAvatar, avatarInBody]
     );
     return res.json(result.rows[0]);
   } catch (e) {
@@ -1135,6 +1158,38 @@ app.delete(
   }
 );
 
+// Delete a single message — only sender or recipient may delete their copy
+app.delete(
+  "/messages/:messageId",
+  requireApiKey,
+  requireRelaySignature,
+  async (req, res) => {
+    const { messageId } = req.params;
+    if (!UUID_RE.test(messageId)) {
+      return res.status(400).json({ error: "invalid_message_id", request_id: req.id });
+    }
+    const requesterUserId = String(req.query.user_id || "").trim();
+    if (!UUID_RE.test(requesterUserId)) {
+      return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
+    }
+    try {
+      const result = await pool.query(
+        `DELETE FROM messages
+         WHERE message_id = $1::uuid
+           AND (sender_id = $2::uuid OR recipient_id = $2::uuid)`,
+        [messageId, requesterUserId]
+      );
+      if (result.rowCount === 0) {
+        return res.status(404).json({ error: "message_not_found", request_id: req.id });
+      }
+      return res.json({ status: "message_deleted", request_id: req.id });
+    } catch (e) {
+      log("error", "delete_message_db", { message: e.message, request_id: req.id });
+      return res.status(500).json({ error: "db_error", request_id: req.id });
+    }
+  }
+);
+
 app.get(
   "/messages/inbox/:recipientId",
   requireApiKey,
@@ -1248,6 +1303,11 @@ async function ensureUsersTable() {
   await pool.query(
     `CREATE INDEX IF NOT EXISTS idx_users_username ON users (username)`
   );
+}
+
+async function ensureUsersOptionalColumns() {
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_b64 TEXT`);
 }
 
 async function ensureBadgesTable() {
@@ -1630,6 +1690,7 @@ function setupWebSocket(httpServer) {
 async function bootstrap() {
   await verifySchemaOrThrow();
   await ensureUsersTable();
+  await ensureUsersOptionalColumns();
   await ensureBadgesTable();
   await ensurePadBatchesTable();
   await ensureIdentityKeysTable();
