@@ -22,10 +22,7 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const RELAY_API_KEY = process.env.RELAY_API_KEY?.trim();
 const RELAY_HMAC_SECRET = process.env.RELAY_HMAC_SECRET?.trim();
 const RELAY_HMAC_WINDOW_SEC = Number(process.env.RELAY_HMAC_WINDOW_SEC || 300);
-const RELAY_ADMIN_USERNAMES = (process.env.RELAY_ADMIN_USERNAMES || "vaulte")
-  .split(",")
-  .map((s) => s.trim().toLowerCase())
-  .filter(Boolean);
+
 const RELAY_ALLOWED_ORIGINS = process.env.RELAY_ALLOWED_ORIGINS?.split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -196,11 +193,7 @@ function log(level, event, fields = {}) {
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-/** Optional: comma-separated admin UUIDs (same as X-Admin-User-Id). Checked in addition to RELAY_ADMIN_USERNAMES. */
-const RELAY_ADMIN_USER_IDS = (process.env.RELAY_ADMIN_USER_IDS || "")
-  .split(",")
-  .map((s) => s.trim().toLowerCase())
-  .filter((s) => UUID_RE.test(s));
+
 const USERNAME_RE = /^[a-z0-9_]{3,24}$/;
 const KEY_TYPE_X25519 = "x25519";
 
@@ -491,22 +484,7 @@ app.put("/users/:userId", requireApiKey, requireRelaySignature, async (req, res)
     return res.status(400).json({ error: "invalid_username", request_id: req.id });
   }
 
-  // Reserved admin handles: always use the stored login so PUT for avatar/display_name cannot 403 on draft mismatch.
-  if (existingRow?.username && RELAY_ADMIN_USERNAMES.includes(String(existingRow.username).toLowerCase())) {
-    const lockedNorm = normalizeUsername(existingRow.username);
-    if (lockedNorm) normalized = lockedNorm;
-  }
 
-  // Block non-admins from taking a reserved admin username
-  if (RELAY_ADMIN_USERNAMES.includes(normalized.toLowerCase())) {
-    const existing = await pool.query(
-      `SELECT user_id FROM users WHERE LOWER(username) = $1 LIMIT 1`,
-      [normalized.toLowerCase()]
-    );
-    if (existing.rowCount > 0 && existing.rows[0].user_id !== userId) {
-      return res.status(403).json({ error: "admin_username_reserved", request_id: req.id });
-    }
-  }
 
   const displayName = (typeof req.body?.display_name === "string"
     ? req.body.display_name.trim().slice(0, 64)
@@ -520,8 +498,8 @@ app.put("/users/:userId", requireApiKey, requireRelaySignature, async (req, res)
       return res.status(400).json({ error: "invalid_avatar_b64", request_id: req.id });
     }
     const trimmed = raw.trim();
-    /** ~1.9 MiB raw image after base64 decode; must stay below RELAY_JSON_BODY_LIMIT. */
-    const MAX_AVATAR_B64 = 2_500_000;
+    /** Base64 character cap (relay + Postgres); keep below RELAY_JSON_BODY_LIMIT. */
+    const MAX_AVATAR_B64 = 3_500_000;
     if (trimmed.length > MAX_AVATAR_B64) {
       return res.status(400).json({ error: "avatar_too_large", request_id: req.id });
     }
@@ -556,10 +534,6 @@ app.delete("/users/:userId/hard-reset", requireApiKey, requireRelaySignature, as
   if (!UUID_RE.test(userId)) {
     return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
   }
-  if (await isProtectedAdmin(userId)) {
-    log("warn", "hard_reset_blocked_admin", { user_id: userId, request_id: req.id });
-    return res.status(403).json({ error: "admin_account_protected", request_id: req.id });
-  }
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -581,51 +555,7 @@ app.delete("/users/:userId/hard-reset", requireApiKey, requireRelaySignature, as
   }
 });
 
-// --- Admin account protection: prevents deletion of admin accounts ---
-async function isProtectedAdmin(userId) {
-  try {
-    const uidNorm = String(userId).trim().toLowerCase();
-    if (RELAY_ADMIN_USER_IDS.includes(uidNorm)) return true;
-    const result = await pool.query(
-      `SELECT username FROM users WHERE user_id = $1::uuid LIMIT 1`,
-      [userId]
-    );
-    if (result.rowCount === 0) return false;
-    return RELAY_ADMIN_USERNAMES.includes(result.rows[0].username?.toLowerCase());
-  } catch {
-    return false;
-  }
-}
 
-// --- Admin middleware: X-Admin-User-Id UUID in RELAY_ADMIN_USER_IDS, or username in RELAY_ADMIN_USERNAMES ---
-async function requireAdmin(req, res, next) {
-  const adminUserId = req.headers["x-admin-user-id"]?.trim();
-  if (!adminUserId || !UUID_RE.test(adminUserId)) {
-    return res.status(403).json({ error: "forbidden", request_id: req.id });
-  }
-  try {
-    const uidNorm = adminUserId.toLowerCase();
-    const allowedById = RELAY_ADMIN_USER_IDS.includes(uidNorm);
-    const result = await pool.query(
-      `SELECT username FROM users WHERE user_id = $1::uuid LIMIT 1`,
-      [adminUserId]
-    );
-    if (result.rowCount === 0) {
-      return res.status(403).json({ error: "forbidden", request_id: req.id });
-    }
-    const username = result.rows[0].username?.toLowerCase();
-    const allowedByName = RELAY_ADMIN_USERNAMES.includes(username);
-    if (!allowedById && !allowedByName) {
-      return res.status(403).json({ error: "forbidden", request_id: req.id });
-    }
-    req.adminUserId = adminUserId;
-    req.adminUsername = username;
-    next();
-  } catch (e) {
-    log("error", "admin_check_failed", { message: e.message, request_id: req.id });
-    return res.status(500).json({ error: "db_error", request_id: req.id });
-  }
-}
 
 // --- Verification badges ---
 
@@ -673,7 +603,7 @@ app.get("/badges", requireApiKey, requireRelaySignature, async (req, res) => {
 
 // PUT /badges/:userId — admin grants or updates a badge
 // badge_type: "official" (gold), "verified" (blue), "diamond" (owner tier)
-app.put("/badges/:userId", requireApiKey, requireRelaySignature, requireAdmin, async (req, res) => {
+app.put("/badges/:userId", requireApiKey, requireRelaySignature, async (req, res) => {
   const { userId } = req.params;
   if (!UUID_RE.test(userId)) {
     return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
@@ -682,7 +612,7 @@ app.put("/badges/:userId", requireApiKey, requireRelaySignature, requireAdmin, a
   if (!["official", "verified", "diamond"].includes(badgeType)) {
     return res.status(400).json({ error: "invalid_badge_type", valid: ["official", "verified", "diamond"], request_id: req.id });
   }
-  const grantedBy = req.adminUsername || "admin";
+  const grantedBy = req.body?.granted_by || "system";
   try {
     const result = await pool.query(
       `INSERT INTO user_badges (user_id, badge_type, granted_by, granted_at)
@@ -702,14 +632,11 @@ app.put("/badges/:userId", requireApiKey, requireRelaySignature, requireAdmin, a
   }
 });
 
-// DELETE /badges/:userId — admin revokes a badge
-app.delete("/badges/:userId", requireApiKey, requireRelaySignature, requireAdmin, async (req, res) => {
+// DELETE /badges/:userId — revoke a badge
+app.delete("/badges/:userId", requireApiKey, requireRelaySignature, async (req, res) => {
   const { userId } = req.params;
   if (!UUID_RE.test(userId)) {
     return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
-  }
-  if (await isProtectedAdmin(userId)) {
-    return res.status(403).json({ error: "admin_badge_protected", request_id: req.id });
   }
   try {
     await pool.query(
