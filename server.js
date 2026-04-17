@@ -194,6 +194,11 @@ function log(level, event, fields = {}) {
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+/** Optional: comma-separated admin UUIDs (same as X-Admin-User-Id). Checked in addition to RELAY_ADMIN_USERNAMES. */
+const RELAY_ADMIN_USER_IDS = (process.env.RELAY_ADMIN_USER_IDS || "")
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter((s) => UUID_RE.test(s));
 const USERNAME_RE = /^[a-z0-9_]{3,24}$/;
 const KEY_TYPE_X25519 = "x25519";
 
@@ -576,6 +581,8 @@ app.delete("/users/:userId/hard-reset", requireApiKey, requireRelaySignature, as
 // --- Admin account protection: prevents deletion of admin accounts ---
 async function isProtectedAdmin(userId) {
   try {
+    const uidNorm = String(userId).trim().toLowerCase();
+    if (RELAY_ADMIN_USER_IDS.includes(uidNorm)) return true;
     const result = await pool.query(
       `SELECT username FROM users WHERE user_id = $1::uuid LIMIT 1`,
       [userId]
@@ -587,13 +594,15 @@ async function isProtectedAdmin(userId) {
   }
 }
 
-// --- Admin middleware: checks X-Admin-User-Id header against allowed usernames ---
+// --- Admin middleware: X-Admin-User-Id UUID in RELAY_ADMIN_USER_IDS, or username in RELAY_ADMIN_USERNAMES ---
 async function requireAdmin(req, res, next) {
   const adminUserId = req.headers["x-admin-user-id"]?.trim();
   if (!adminUserId || !UUID_RE.test(adminUserId)) {
     return res.status(403).json({ error: "forbidden", request_id: req.id });
   }
   try {
+    const uidNorm = adminUserId.toLowerCase();
+    const allowedById = RELAY_ADMIN_USER_IDS.includes(uidNorm);
     const result = await pool.query(
       `SELECT username FROM users WHERE user_id = $1::uuid LIMIT 1`,
       [adminUserId]
@@ -602,7 +611,8 @@ async function requireAdmin(req, res, next) {
       return res.status(403).json({ error: "forbidden", request_id: req.id });
     }
     const username = result.rows[0].username?.toLowerCase();
-    if (!RELAY_ADMIN_USERNAMES.includes(username)) {
+    const allowedByName = RELAY_ADMIN_USERNAMES.includes(username);
+    if (!allowedById && !allowedByName) {
       return res.status(403).json({ error: "forbidden", request_id: req.id });
     }
     req.adminUserId = adminUserId;
