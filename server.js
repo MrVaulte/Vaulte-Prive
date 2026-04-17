@@ -659,15 +659,15 @@ app.get("/badges", requireApiKey, requireRelaySignature, async (req, res) => {
 });
 
 // PUT /badges/:userId — admin grants or updates a badge
-// badge_type: "official" (admin-granted, gold) or "verified" (purchased, blue)
+// badge_type: "official" (gold), "verified" (blue), "diamond" (owner tier)
 app.put("/badges/:userId", requireApiKey, requireRelaySignature, requireAdmin, async (req, res) => {
   const { userId } = req.params;
   if (!UUID_RE.test(userId)) {
     return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
   }
   const badgeType = req.body?.badge_type;
-  if (!["official", "verified"].includes(badgeType)) {
-    return res.status(400).json({ error: "invalid_badge_type", valid: ["official", "verified"], request_id: req.id });
+  if (!["official", "verified", "diamond"].includes(badgeType)) {
+    return res.status(400).json({ error: "invalid_badge_type", valid: ["official", "verified", "diamond"], request_id: req.id });
   }
   const grantedBy = req.adminUsername || "admin";
   try {
@@ -1104,9 +1104,10 @@ app.get(
       200
     );
 
+    const viewerRaw = String(req.query.user_id || "").trim();
+
     try {
-      const result = await pool.query(
-        `SELECT
+      let sql = `SELECT
         message_id,
         conversation_id,
         sender_id,
@@ -1116,11 +1117,14 @@ app.get(
         created_at
        FROM messages
        WHERE conversation_id = $1::uuid
-         AND (created_at::timestamptz) > $2::timestamptz
-       ORDER BY created_at ASC
-       LIMIT $3`,
-        [conversationId, since, limit]
-      );
+         AND (created_at::timestamptz) > $2::timestamptz`;
+      const params = [conversationId, since, limit];
+      if (UUID_RE.test(viewerRaw)) {
+        sql += ` AND (sender_id = $4::uuid OR recipient_id = $4::uuid)`;
+        params.push(viewerRaw);
+      }
+      sql += ` ORDER BY created_at ASC LIMIT $3`;
+      const result = await pool.query(sql, params);
 
       res.setHeader("Cache-Control", "private, no-store");
       return res.json(result.rows);
@@ -1326,11 +1330,39 @@ async function ensureBadgesTable() {
   await pool.query(
     `CREATE TABLE IF NOT EXISTS user_badges (
       user_id UUID PRIMARY KEY,
-      badge_type TEXT NOT NULL CHECK (badge_type IN ('official', 'verified')),
+      badge_type TEXT NOT NULL CHECK (badge_type IN ('official', 'verified', 'diamond')),
       granted_by TEXT NOT NULL DEFAULT 'admin',
       granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`
   );
+}
+
+/** Existing deployments may still have the two-value CHECK; widen to include diamond. */
+async function migrateBadgesConstraintForDiamond() {
+  try {
+    const r = await pool.query(
+      `SELECT c.conname, pg_get_constraintdef(c.oid) AS def
+       FROM pg_constraint c
+       JOIN pg_class t ON c.conrelid = t.oid
+       WHERE t.relname = 'user_badges' AND c.contype = 'c'`
+    );
+    for (const row of r.rows) {
+      if (String(row.def).includes("badge_type")) {
+        const safe = String(row.conname).replace(/"/g, "");
+        await pool.query(`ALTER TABLE user_badges DROP CONSTRAINT "${safe}"`);
+      }
+    }
+  } catch (e) {
+    log("warn", "badges_drop_constraint", { message: e.message });
+  }
+  try {
+    await pool.query(
+      `ALTER TABLE user_badges ADD CONSTRAINT user_badges_badge_type_check CHECK (badge_type IN ('official', 'verified', 'diamond'))`
+    );
+  } catch (e) {
+    if (e.code === "42710") return;
+    log("warn", "badges_add_constraint_diamond", { message: e.message });
+  }
 }
 
 async function ensurePadBatchesTable() {
@@ -1704,6 +1736,7 @@ async function bootstrap() {
   await ensureUsersTable();
   await ensureUsersOptionalColumns();
   await ensureBadgesTable();
+  await migrateBadgesConstraintForDiamond();
   await ensurePadBatchesTable();
   await ensureIdentityKeysTable();
   await ensurePrekeysTable();
