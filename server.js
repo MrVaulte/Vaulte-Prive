@@ -29,6 +29,8 @@ const RELAY_ADMIN_USERNAMES = (process.env.RELAY_ADMIN_USERNAMES || "vaulte")
 const RELAY_ALLOWED_ORIGINS = process.env.RELAY_ALLOWED_ORIGINS?.split(",")
   .map((s) => s.trim())
   .filter(Boolean);
+/** Max JSON body (avatars, pad-batches). Default 12mb — was 1mb and caused PUT /users … "request entity too large". */
+const RELAY_JSON_BODY_LIMIT = process.env.RELAY_JSON_BODY_LIMIT?.trim() || "12mb";
 
 // Render / reverse proxies
 app.set("trust proxy", Number(process.env.TRUST_PROXY_HOPS || 1));
@@ -74,7 +76,7 @@ app.use(
 
 app.use(
   express.json({
-    limit: "1mb",
+    limit: RELAY_JSON_BODY_LIMIT,
     verify: (req, _res, buf) => {
       req.rawBody = Buffer.from(buf);
     },
@@ -518,7 +520,8 @@ app.put("/users/:userId", requireApiKey, requireRelaySignature, async (req, res)
       return res.status(400).json({ error: "invalid_avatar_b64", request_id: req.id });
     }
     const trimmed = raw.trim();
-    const MAX_AVATAR_B64 = 600_000;
+    /** ~1.9 MiB raw image after base64 decode; must stay below RELAY_JSON_BODY_LIMIT. */
+    const MAX_AVATAR_B64 = 2_500_000;
     if (trimmed.length > MAX_AVATAR_B64) {
       return res.status(400).json({ error: "avatar_too_large", request_id: req.id });
     }
@@ -1280,6 +1283,13 @@ app.use((req, res) => {
 
 // Error handler
 app.use((err, req, res, _next) => {
+  if (err && (err.status === 413 || err.type === "entity.too.large")) {
+    log("warn", "payload_too_large", { message: err.message, request_id: req.id });
+    if (!res.headersSent) {
+      return res.status(413).json({ error: "payload_too_large", request_id: req.id });
+    }
+    return;
+  }
   log("error", "unhandled", { message: err.message, request_id: req.id });
   if (!res.headersSent) {
     res.status(500).json({ error: "internal_error", request_id: req.id });
