@@ -794,6 +794,7 @@ app.post("/keys/:userId/one-time-prekeys", requireApiKey, requireRelaySignature,
     return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
   }
   const keys = req.body?.keys;
+  const replaceExisting = req.body?.replace_existing === true;
   if (!Array.isArray(keys) || keys.length === 0 || keys.length > 100) {
     return res.status(400).json({ error: "invalid_keys_array", request_id: req.id });
   }
@@ -801,6 +802,12 @@ app.post("/keys/:userId/one-time-prekeys", requireApiKey, requireRelaySignature,
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      if (replaceExisting) {
+        await client.query(`DELETE FROM one_time_prekeys WHERE user_id = $1::uuid`, [userId]);
+        // Pending initial X3DH messages depend on the previous OTP set and cannot be
+        // decrypted once the device repairs/replaces its local OTP inventory.
+        await client.query(`DELETE FROM initial_x3dh_messages WHERE recipient_id = $1::uuid AND consumed_at IS NULL`, [userId]);
+      }
       for (const k of keys) {
         const kid = Number(k.key_id);
         if (!Number.isInteger(kid) || kid < 0 || !validatePublicKeyBase64(k.public_key_base64)) continue;
@@ -818,7 +825,7 @@ app.post("/keys/:userId/one-time-prekeys", requireApiKey, requireRelaySignature,
     } finally {
       client.release();
     }
-    return res.json({ ok: true, uploaded: keys.length });
+    return res.json({ ok: true, uploaded: keys.length, replaced_existing: replaceExisting });
   } catch (e) {
     log("error", "post_one_time_prekeys_db", { message: e.message, request_id: req.id });
     return res.status(500).json({ error: "db_error", request_id: req.id });
