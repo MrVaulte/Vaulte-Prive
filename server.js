@@ -1097,7 +1097,8 @@ app.get(
         recipient_id,
         pad_id,
         ciphertext_base64,
-        created_at
+        created_at,
+        delivered_at
        FROM messages
        WHERE conversation_id = $1::uuid
          AND (created_at::timestamptz) > $2::timestamptz`;
@@ -1225,7 +1226,8 @@ app.get(
         recipient_id,
         pad_id,
         ciphertext_base64,
-        created_at
+        created_at,
+        delivered_at
        FROM messages
        WHERE recipient_id = $1::uuid
          AND (created_at::timestamptz) > $2::timestamptz
@@ -1395,6 +1397,46 @@ app.delete(
         message: e.message,
         request_id: req.id,
       });
+      return res.status(500).json({ error: "db_error", request_id: req.id });
+    }
+  }
+);
+
+// POST /messages/:messageId/ack — recipient confirms delivery
+app.post(
+  "/messages/:messageId/ack",
+  requireApiKey,
+  requireRelaySignature,
+  async (req, res) => {
+    const { messageId } = req.params;
+    if (!UUID_RE.test(messageId)) {
+      return res.status(400).json({ error: "invalid_message_id", request_id: req.id });
+    }
+    const recipientId = String(req.body?.recipient_id || "").trim();
+    if (!UUID_RE.test(recipientId)) {
+      return res.status(400).json({ error: "invalid_recipient_id", request_id: req.id });
+    }
+    try {
+      const result = await pool.query(
+        `UPDATE messages
+         SET delivered_at = NOW()
+         WHERE message_id = $1::uuid
+           AND recipient_id = $2::uuid
+           AND delivered_at IS NULL
+         RETURNING message_id, delivered_at`,
+        [messageId, recipientId]
+      );
+      if (result.rowCount === 0) {
+        // Either not found, wrong recipient, or already acked — all fine
+        return res.json({ status: "already_acked", request_id: req.id });
+      }
+      return res.json({
+        status: "acked",
+        delivered_at: result.rows[0].delivered_at,
+        request_id: req.id,
+      });
+    } catch (e) {
+      log("error", "ack_message_db", { message: e.message, request_id: req.id });
       return res.status(500).json({ error: "db_error", request_id: req.id });
     }
   }
@@ -1576,6 +1618,12 @@ async function ensurePrekeysTable() {
   );
   await pool.query(
     `CREATE INDEX IF NOT EXISTS idx_otp_prekeys_user ON one_time_prekeys (user_id)`
+  );
+}
+
+async function ensureMessagesDeliveredAt() {
+  await pool.query(
+    `ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ`
   );
 }
 
@@ -1908,6 +1956,7 @@ async function bootstrap() {
   await ensureIdentityKeysTable();
   await ensurePrekeysTable();
   await ensureInitialX3DHMessagesTable();
+  await ensureMessagesDeliveredAt();
   await sweepExpiredPadBatches();
   setInterval(sweepExpiredPadBatches, PAD_BATCH_SWEEP_INTERVAL_SEC * 1000).unref();
   server = app.listen(PORT, () => {
