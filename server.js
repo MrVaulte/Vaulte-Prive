@@ -245,6 +245,32 @@ function looksLikeE2EPlusEnvelopeBytes(buf) {
       return true;
     }
 
+    // v5 E2E+ outer envelope (relay stays zero-trust and only validates shape)
+    if (obj.version === 5 && obj.mode === "e2e_plus") {
+      if (typeof obj.cipherSuite !== "string") return false;
+      if (typeof obj.outerNonceB64 !== "string") return false;
+      if (typeof obj.outerCiphertextB64 !== "string") return false;
+      if (typeof obj.outerTagB64 !== "string") return false;
+      if (!obj.header || typeof obj.header.publicKeyB64 !== "string") return false;
+      if (typeof obj.header.outerSaltB64 !== "string") return false;
+      const nonce = decodeStrictBase64(obj.outerNonceB64);
+      const ciphertext = decodeStrictBase64(obj.outerCiphertextB64);
+      const tag = decodeStrictBase64(obj.outerTagB64);
+      const salt = decodeStrictBase64(obj.header.outerSaltB64);
+      if (!nonce || nonce.length !== 12) return false;
+      if (!tag || tag.length !== 16) return false;
+      if (!ciphertext || ciphertext.length === 0) return false;
+      if (!salt || salt.length !== 32) return false;
+      if (obj.pad !== undefined && obj.pad !== null) {
+        if (typeof obj.pad !== "object") return false;
+        if (obj.pad.padId !== null && obj.pad.padId !== undefined && !UUID_RE.test(obj.pad.padId)) return false;
+        if (typeof obj.pad.mode !== "string") return false;
+        if (!Number.isInteger(obj.pad.bytesMixed) || obj.pad.bytesMixed < 0 || obj.pad.bytesMixed > 4096) return false;
+        if (obj.pad.digestB64 !== null && obj.pad.digestB64 !== undefined && !decodeStrictBase64(obj.pad.digestB64)) return false;
+      }
+      return true;
+    }
+
     return false;
   } catch {
     return false;
