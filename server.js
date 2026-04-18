@@ -349,6 +349,49 @@ function validatePadBatchBody(body) {
   return null;
 }
 
+function validateInitialX3DHMessageDTO(body) {
+  const required = [
+    "message_id",
+    "conversation_id",
+    "sender_id",
+    "recipient_id",
+    "identity_key",
+    "ephemeral_key",
+    "signed_prekey_id",
+    "ciphertext_base64",
+    "created_at",
+  ];
+  for (const key of required) {
+    if (!(key in body)) return `missing field: ${key}`;
+  }
+  const uuidFields = ["message_id", "conversation_id", "sender_id", "recipient_id"];
+  for (const key of uuidFields) {
+    if (typeof body[key] !== "string" || !UUID_RE.test(body[key])) {
+      return `invalid uuid: ${key}`;
+    }
+  }
+  if (!validatePublicKeyBase64(body.identity_key)) return "invalid_identity_key";
+  if (!validatePublicKeyBase64(body.ephemeral_key)) return "invalid_ephemeral_key";
+  if (!Number.isInteger(Number(body.signed_prekey_id)) || Number(body.signed_prekey_id) < 0) {
+    return "invalid_signed_prekey_id";
+  }
+  if (
+    body.one_time_prekey_id !== undefined &&
+    body.one_time_prekey_id !== null &&
+    (!Number.isInteger(Number(body.one_time_prekey_id)) || Number(body.one_time_prekey_id) < 0)
+  ) {
+    return "invalid_one_time_prekey_id";
+  }
+  if (typeof body.ciphertext_base64 !== "string" || !body.ciphertext_base64.startsWith("e2:")) {
+    return "invalid_ciphertext_base64";
+  }
+  const raw = body.ciphertext_base64.slice(3);
+  const err = validateOpaqueCipherBase64(raw);
+  if (err) return err;
+  if (!isIsoDate(body.created_at)) return "invalid_date";
+  return null;
+}
+
 async function sweepExpiredPadBatches() {
   try {
     await pool.query(`DELETE FROM pad_batches WHERE expires_at < NOW()`);
@@ -1203,6 +1246,160 @@ app.get(
   }
 );
 
+// POST — сохранить initial message
+app.post(
+  "/messages/initial-x3dh",
+  requireApiKey,
+  requireRelaySignature,
+  postMessageLimiter,
+  async (req, res) => {
+    const error = validateInitialX3DHMessageDTO(req.body || {});
+    if (error) {
+      return res.status(400).json({ error, request_id: req.id });
+    }
+    const m = req.body;
+    try {
+      const result = await pool.query(
+        `INSERT INTO initial_x3dh_messages
+         (message_id, conversation_id, sender_id, recipient_id,
+          identity_key, ephemeral_key,
+          signed_prekey_id, one_time_prekey_id,
+          ciphertext_base64, created_at, received_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         ON CONFLICT (message_id) DO NOTHING
+         RETURNING message_id`,
+        [
+          m.message_id,
+          m.conversation_id,
+          m.sender_id,
+          m.recipient_id,
+          m.identity_key,
+          m.ephemeral_key,
+          m.signed_prekey_id,
+          m.one_time_prekey_id || null,
+          m.ciphertext_base64,
+          m.created_at,
+          new Date().toISOString(),
+        ]
+      );
+      if (result.rowCount === 0) {
+        return res.status(200).json({
+          status: "duplicate_accepted",
+          request_id: req.id,
+        });
+      }
+      return res.status(201).json({
+        status: "stored",
+        request_id: req.id,
+      });
+    } catch (e) {
+      log("error", "post_initial_x3dh_db", {
+        message: e.message,
+        request_id: req.id,
+      });
+      return res.status(500).json({ error: "db_error", request_id: req.id });
+    }
+  }
+);
+
+// GET — получить initial messages
+app.get(
+  "/messages/initial-x3dh",
+  requireApiKey,
+  requireRelaySignature,
+  getMessagesLimiter,
+  async (req, res) => {
+    const recipientId = String(req.query.recipient_id || "").trim();
+    if (!UUID_RE.test(recipientId)) {
+      return res.status(400).json({
+        error: "invalid_recipient_id",
+        request_id: req.id,
+      });
+    }
+    const sinceRaw = req.query.since;
+    const since =
+      typeof sinceRaw === "string" && sinceRaw.length > 0
+        ? sinceRaw
+        : "1970-01-01T00:00:00.000Z";
+    const n = Number(req.query.limit);
+    const limit = Math.min(Math.max(Number.isFinite(n) ? Math.floor(n) : 50, 1), 200);
+    try {
+      const result = await pool.query(
+        `SELECT
+          message_id,
+          conversation_id,
+          sender_id,
+          recipient_id,
+          identity_key,
+          ephemeral_key,
+          signed_prekey_id,
+          one_time_prekey_id,
+          ciphertext_base64,
+          created_at
+         FROM initial_x3dh_messages
+         WHERE recipient_id = $1::uuid
+           AND consumed_at IS NULL
+           AND created_at > $2::timestamptz
+         ORDER BY created_at ASC
+         LIMIT $3`,
+        [recipientId, since, limit]
+      );
+      res.setHeader("Cache-Control", "private, no-store");
+      return res.json(result.rows);
+    } catch (e) {
+      log("error", "get_initial_x3dh_db", {
+        message: e.message,
+        request_id: req.id,
+      });
+      return res.status(500).json({ error: "db_error", request_id: req.id });
+    }
+  }
+);
+
+// DELETE — пометить как consumed
+app.delete(
+  "/messages/initial-x3dh/:messageId",
+  requireApiKey,
+  requireRelaySignature,
+  async (req, res) => {
+    const { messageId } = req.params;
+    const userId = String(req.query.user_id || "").trim();
+    if (!UUID_RE.test(messageId)) {
+      return res.status(400).json({ error: "invalid_message_id", request_id: req.id });
+    }
+    if (!UUID_RE.test(userId)) {
+      return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
+    }
+    try {
+      const result = await pool.query(
+        `UPDATE initial_x3dh_messages
+         SET consumed_at = NOW()
+         WHERE message_id = $1::uuid
+           AND recipient_id = $2::uuid
+           AND consumed_at IS NULL
+         RETURNING message_id`,
+        [messageId, userId]
+      );
+      if (result.rowCount === 0) {
+        return res.status(404).json({
+          error: "message_not_found_or_already_consumed",
+          request_id: req.id,
+        });
+      }
+      return res.json({
+        status: "consumed",
+        request_id: req.id,
+      });
+    } catch (e) {
+      log("error", "delete_initial_x3dh_db", {
+        message: e.message,
+        request_id: req.id,
+      });
+      return res.status(500).json({ error: "db_error", request_id: req.id });
+    }
+  }
+);
+
 // 404
 app.use((req, res) => {
   res.status(404).json({ error: "not_found", request_id: req.id });
@@ -1379,6 +1576,29 @@ async function ensurePrekeysTable() {
   );
   await pool.query(
     `CREATE INDEX IF NOT EXISTS idx_otp_prekeys_user ON one_time_prekeys (user_id)`
+  );
+}
+
+async function ensureInitialX3DHMessagesTable() {
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS initial_x3dh_messages (
+      message_id UUID PRIMARY KEY,
+      conversation_id UUID NOT NULL,
+      sender_id UUID NOT NULL,
+      recipient_id UUID NOT NULL,
+      identity_key TEXT NOT NULL,
+      ephemeral_key TEXT NOT NULL,
+      signed_prekey_id INTEGER NOT NULL,
+      one_time_prekey_id INTEGER,
+      ciphertext_base64 TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL,
+      received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      consumed_at TIMESTAMPTZ
+    )`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_initial_x3dh_recipient_created
+     ON initial_x3dh_messages (recipient_id, created_at)`
   );
 }
 
@@ -1687,6 +1907,7 @@ async function bootstrap() {
   await ensurePadBatchesTable();
   await ensureIdentityKeysTable();
   await ensurePrekeysTable();
+  await ensureInitialX3DHMessagesTable();
   await sweepExpiredPadBatches();
   setInterval(sweepExpiredPadBatches, PAD_BATCH_SWEEP_INTERVAL_SEC * 1000).unref();
   server = app.listen(PORT, () => {
