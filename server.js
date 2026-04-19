@@ -8,6 +8,7 @@ const cors = require("cors");
 const { Pool } = require("pg");
 const rateLimit = require("express-rate-limit");
 const crypto = require("crypto");
+const http2 = require("http2");
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -28,6 +29,12 @@ const RELAY_ALLOWED_ORIGINS = process.env.RELAY_ALLOWED_ORIGINS?.split(",")
   .filter(Boolean);
 /** Max JSON body (avatars, pad-batches). Default 12mb — was 1mb and caused PUT /users … "request entity too large". */
 const RELAY_JSON_BODY_LIMIT = process.env.RELAY_JSON_BODY_LIMIT?.trim() || "12mb";
+const APNS_TEAM_ID = process.env.APNS_TEAM_ID?.trim();
+const APNS_KEY_ID = process.env.APNS_KEY_ID?.trim();
+const APNS_BUNDLE_ID = process.env.APNS_BUNDLE_ID?.trim();
+const APNS_AUTH_KEY_P8 = process.env.APNS_AUTH_KEY_P8?.replace(/\\n/g, "\n").trim();
+const APNS_USE_SANDBOX = String(process.env.APNS_USE_SANDBOX || "").trim() === "1";
+const APNS_HOST = APNS_USE_SANDBOX ? "https://api.sandbox.push.apple.com" : "https://api.push.apple.com";
 
 // Render / reverse proxies
 app.set("trust proxy", Number(process.env.TRUST_PROXY_HOPS || 1));
@@ -189,6 +196,126 @@ function log(level, event, fields = {}) {
   else console.log(line);
 }
 
+function hasApnsConfig() {
+  return Boolean(APNS_TEAM_ID && APNS_KEY_ID && APNS_BUNDLE_ID && APNS_AUTH_KEY_P8);
+}
+
+function base64UrlEncode(input) {
+  return Buffer.from(input)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function makeApnsJwt() {
+  if (!hasApnsConfig()) return null;
+  const header = base64UrlEncode(JSON.stringify({ alg: "ES256", kid: APNS_KEY_ID }));
+  const issuedAt = Math.floor(Date.now() / 1000);
+  const claims = base64UrlEncode(JSON.stringify({ iss: APNS_TEAM_ID, iat: issuedAt }));
+  const unsigned = `${header}.${claims}`;
+  const signer = crypto.createSign("sha256");
+  signer.update(unsigned);
+  signer.end();
+  const signature = signer.sign(APNS_AUTH_KEY_P8);
+  return `${unsigned}.${base64UrlEncode(signature)}`;
+}
+
+async function deletePushToken(userId, deviceToken) {
+  try {
+    await pool.query(
+      `DELETE FROM user_push_tokens
+       WHERE user_id = $1::uuid AND device_token = $2`,
+      [userId, deviceToken]
+    );
+  } catch (e) {
+    log("warn", "push_token_delete_failed", { userId, message: e.message });
+  }
+}
+
+async function sendApnsToDevice(userId, deviceToken, payload, topic) {
+  const jwt = makeApnsJwt();
+  if (!jwt) return false;
+
+  return new Promise((resolve) => {
+    const client = http2.connect(APNS_HOST);
+    let statusCode = 0;
+    let responseBody = "";
+    const req = client.request({
+      ":method": "POST",
+      ":path": `/3/device/${deviceToken}`,
+      authorization: `bearer ${jwt}`,
+      "apns-topic": topic || APNS_BUNDLE_ID,
+      "apns-push-type": "alert",
+      "apns-priority": "10",
+      "content-type": "application/json",
+    });
+
+    req.setEncoding("utf8");
+    req.on("response", (headers) => {
+      statusCode = Number(headers[":status"] || 0);
+    });
+    req.on("data", (chunk) => {
+      responseBody += chunk;
+    });
+    req.on("end", async () => {
+      client.close();
+      if (statusCode >= 200 && statusCode < 300) {
+        resolve(true);
+        return;
+      }
+      let reason = "";
+      try {
+        reason = String(JSON.parse(responseBody || "{}").reason || "");
+      } catch {}
+      if (["BadDeviceToken", "DeviceTokenNotForTopic", "Unregistered"].includes(reason)) {
+        await deletePushToken(userId, deviceToken);
+      }
+      log("warn", "apns_send_failed", { userId, statusCode, reason });
+      resolve(false);
+    });
+    req.on("error", (error) => {
+      client.close();
+      log("warn", "apns_transport_error", { userId, message: error.message });
+      resolve(false);
+    });
+    req.end(JSON.stringify(payload));
+  });
+}
+
+async function pushGenericNewMessageNotification({ recipientId, senderId, conversationId, messageId, kind = "message" }) {
+  if (!hasApnsConfig()) return;
+  try {
+    const result = await pool.query(
+      `SELECT device_token, COALESCE(bundle_id, $2) AS bundle_id
+       FROM user_push_tokens
+       WHERE user_id = $1::uuid`,
+      [recipientId, APNS_BUNDLE_ID]
+    );
+    if (!result.rows.length) return;
+    const payload = {
+      aps: {
+        alert: {
+          title: "Vaulté Privé",
+          body: kind === "initial_x3dh" ? "New secure chat request in Vaulté Privé" : "New message in Vaulté Privé",
+        },
+        sound: "default",
+        badge: 1,
+      },
+      type: kind,
+      sender_id: senderId,
+      recipient_id: recipientId,
+      conversation_id: conversationId,
+      message_id: messageId,
+    };
+    for (const row of result.rows) {
+      await sendApnsToDevice(recipientId, String(row.device_token), payload, String(row.bundle_id || APNS_BUNDLE_ID));
+    }
+  } catch (e) {
+    log("warn", "push_notify_failed", { recipientId, message: e.message });
+  }
+}
+
 // --- VALIDATION ---
 
 const UUID_RE =
@@ -242,32 +369,6 @@ function looksLikeE2EPlusEnvelopeBytes(buf) {
       if (typeof obj.ciphertextB64 !== "string") return false;
       if (typeof obj.tagB64 !== "string") return false;
       if (!obj.header || typeof obj.header.publicKeyB64 !== "string") return false;
-      return true;
-    }
-
-    // v5 E2E+ outer envelope (relay stays zero-trust and only validates shape)
-    if (obj.version === 5 && obj.mode === "e2e_plus") {
-      if (typeof obj.cipherSuite !== "string") return false;
-      if (typeof obj.outerNonceB64 !== "string") return false;
-      if (typeof obj.outerCiphertextB64 !== "string") return false;
-      if (typeof obj.outerTagB64 !== "string") return false;
-      if (!obj.header || typeof obj.header.publicKeyB64 !== "string") return false;
-      if (typeof obj.header.outerSaltB64 !== "string") return false;
-      const nonce = decodeStrictBase64(obj.outerNonceB64);
-      const ciphertext = decodeStrictBase64(obj.outerCiphertextB64);
-      const tag = decodeStrictBase64(obj.outerTagB64);
-      const salt = decodeStrictBase64(obj.header.outerSaltB64);
-      if (!nonce || nonce.length !== 12) return false;
-      if (!tag || tag.length !== 16) return false;
-      if (!ciphertext || ciphertext.length === 0) return false;
-      if (!salt || salt.length !== 32) return false;
-      if (obj.pad !== undefined && obj.pad !== null) {
-        if (typeof obj.pad !== "object") return false;
-        if (obj.pad.padId !== null && obj.pad.padId !== undefined && !UUID_RE.test(obj.pad.padId)) return false;
-        if (typeof obj.pad.mode !== "string") return false;
-        if (!Number.isInteger(obj.pad.bytesMixed) || obj.pad.bytesMixed < 0 || obj.pad.bytesMixed > 4096) return false;
-        if (obj.pad.digestB64 !== null && obj.pad.digestB64 !== undefined && !decodeStrictBase64(obj.pad.digestB64)) return false;
-      }
       return true;
     }
 
@@ -613,6 +714,7 @@ app.delete("/users/:userId/hard-reset", requireApiKey, requireRelaySignature, as
     await client.query(`DELETE FROM one_time_prekeys WHERE user_id = $1::uuid`, [userId]);
     await client.query(`DELETE FROM pad_batches WHERE owner_user_id = $1::uuid`, [userId]);
     await client.query(`DELETE FROM user_badges WHERE user_id = $1::uuid`, [userId]);
+    await client.query(`DELETE FROM user_push_tokens WHERE user_id = $1::uuid`, [userId]);
     await client.query("COMMIT");
     return res.json({ status: "hard_reset_completed", request_id: req.id });
   } catch (e) {
@@ -621,6 +723,51 @@ app.delete("/users/:userId/hard-reset", requireApiKey, requireRelaySignature, as
     return res.status(500).json({ error: "db_error", request_id: req.id });
   } finally {
     client.release();
+  }
+});
+
+app.put("/users/:userId/push-devices/apns", requireApiKey, requireRelaySignature, async (req, res) => {
+  const { userId } = req.params;
+  if (!UUID_RE.test(userId)) {
+    return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
+  }
+  const deviceToken = String(req.body?.device_token || "").trim().toLowerCase();
+  const bundleId = String(req.body?.bundle_id || "").trim() || APNS_BUNDLE_ID || null;
+  if (!/^[0-9a-f]{64,200}$/.test(deviceToken)) {
+    return res.status(400).json({ error: "invalid_device_token", request_id: req.id });
+  }
+  try {
+    await pool.query(
+      `INSERT INTO user_push_tokens (user_id, device_token, platform, bundle_id, updated_at, last_seen_at)
+       VALUES ($1::uuid, $2, 'apns', $3, NOW(), NOW())
+       ON CONFLICT (user_id, device_token, platform)
+       DO UPDATE SET bundle_id = EXCLUDED.bundle_id,
+                     updated_at = NOW(),
+                     last_seen_at = NOW()`,
+      [userId, deviceToken, bundleId]
+    );
+    return res.json({ status: "push_device_registered", request_id: req.id });
+  } catch (e) {
+    log("error", "put_push_device_db", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
+  }
+});
+
+app.delete("/users/:userId/push-devices/apns/:deviceToken", requireApiKey, requireRelaySignature, async (req, res) => {
+  const { userId, deviceToken } = req.params;
+  if (!UUID_RE.test(userId)) {
+    return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
+  }
+  const normalized = String(deviceToken || "").trim().toLowerCase();
+  if (!/^[0-9a-f]{64,200}$/.test(normalized)) {
+    return res.status(400).json({ error: "invalid_device_token", request_id: req.id });
+  }
+  try {
+    await deletePushToken(userId, normalized);
+    return res.json({ status: "push_device_deleted", request_id: req.id });
+  } catch (e) {
+    log("error", "delete_push_device_db", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
   }
 });
 
@@ -1082,6 +1229,14 @@ app.post("/messages", requireApiKey, requireRelaySignature, postMessageLimiter, 
       });
     }
 
+    void pushGenericNewMessageNotification({
+      recipientId: m.recipient_id,
+      senderId: m.sender_id,
+      conversationId: m.conversation_id,
+      messageId: m.message_id,
+      kind: "message",
+    });
+
     return res.status(201).json({ status: "stored", request_id: req.id });
   } catch (e) {
     log("error", "post_messages_db", {
@@ -1323,6 +1478,13 @@ app.post(
           request_id: req.id,
         });
       }
+      void pushGenericNewMessageNotification({
+        recipientId: m.recipient_id,
+        senderId: m.sender_id,
+        conversationId: m.conversation_id,
+        messageId: m.message_id,
+        kind: "initial_x3dh",
+      });
       return res.status(201).json({
         status: "stored",
         request_id: req.id,
@@ -1660,6 +1822,23 @@ async function ensureMessagesDeliveredAt() {
   );
 }
 
+async function ensurePushDevicesTable() {
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS user_push_tokens (
+      user_id UUID NOT NULL,
+      device_token TEXT NOT NULL,
+      platform TEXT NOT NULL DEFAULT 'apns',
+      bundle_id TEXT,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_id, device_token, platform)
+    )`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON user_push_tokens (user_id, updated_at DESC)`
+  );
+}
+
 async function ensureInitialX3DHMessagesTable() {
   await pool.query(
     `CREATE TABLE IF NOT EXISTS initial_x3dh_messages (
@@ -1990,6 +2169,7 @@ async function bootstrap() {
   await ensurePrekeysTable();
   await ensureInitialX3DHMessagesTable();
   await ensureMessagesDeliveredAt();
+  await ensurePushDevicesTable();
   await sweepExpiredPadBatches();
   setInterval(sweepExpiredPadBatches, PAD_BATCH_SWEEP_INTERVAL_SEC * 1000).unref();
   server = app.listen(PORT, () => {
@@ -1997,6 +2177,7 @@ async function bootstrap() {
       port: PORT,
       api_key_required: Boolean(RELAY_API_KEY),
       hmac_required: Boolean(RELAY_HMAC_SECRET),
+      apns_enabled: hasApnsConfig(),
       cors_origins: RELAY_ALLOWED_ORIGINS?.length ?? "any",
     });
   });
