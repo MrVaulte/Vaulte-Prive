@@ -23,6 +23,8 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const RELAY_API_KEY = process.env.RELAY_API_KEY?.trim();
 const RELAY_HMAC_SECRET = process.env.RELAY_HMAC_SECRET?.trim();
 const RELAY_HMAC_WINDOW_SEC = Number(process.env.RELAY_HMAC_WINDOW_SEC || 300);
+/** Optional bearer for aggregate admin routes (`X-Relay-Admin-Token`). No message bodies are ever returned. */
+const RELAY_ADMIN_TOKEN = process.env.RELAY_ADMIN_TOKEN?.trim();
 
 const RELAY_ALLOWED_ORIGINS = process.env.RELAY_ALLOWED_ORIGINS?.split(",")
   .map((s) => s.trim())
@@ -112,6 +114,25 @@ function timingSafeEqualHex(a, b) {
   if (aa.length === 0 || bb.length === 0) return false;
   if (aa.length !== bb.length) return false;
   return crypto.timingSafeEqual(aa, bb);
+}
+
+function timingSafeEqualUtf8(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const aa = Buffer.from(a, "utf8");
+  const bb = Buffer.from(b, "utf8");
+  if (aa.length !== bb.length) return false;
+  return crypto.timingSafeEqual(aa, bb);
+}
+
+function requireRelayAdmin(req, res, next) {
+  if (!RELAY_ADMIN_TOKEN) {
+    return res.status(503).json({ error: "admin_disabled", request_id: req.id });
+  }
+  const h = req.headers["x-relay-admin-token"];
+  if (typeof h !== "string" || !timingSafeEqualUtf8(h, RELAY_ADMIN_TOKEN)) {
+    return res.status(401).json({ error: "admin_unauthorized", request_id: req.id });
+  }
+  next();
 }
 
 function canonicalizeURL(originalUrl) {
@@ -322,6 +343,7 @@ const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const USERNAME_RE = /^[a-z0-9_]{3,24}$/;
+const ETH_ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/;
 const KEY_TYPE_X25519 = "x25519";
 
 function isIsoDate(value) {
@@ -564,7 +586,7 @@ app.get("/users/resolve", requireApiKey, requireRelaySignature, async (req, res)
   }
   try {
     const result = await pool.query(
-      `SELECT user_id, username, display_name, avatar_b64, updated_at
+      `SELECT user_id, username, display_name, avatar_b64, wallet_address, updated_at
        FROM users
        WHERE username = $1
        LIMIT 1`,
@@ -590,7 +612,7 @@ app.get("/users/search", requireApiKey, requireRelaySignature, async (req, res) 
   const limit = Math.min(Math.max(Number.isFinite(n) ? Math.floor(n) : 20, 1), 50);
   try {
     const result = await pool.query(
-      `SELECT user_id, username, display_name, avatar_b64, updated_at
+      `SELECT user_id, username, display_name, avatar_b64, wallet_address, updated_at
        FROM users
        WHERE username LIKE $1
        ORDER BY username ASC
@@ -611,7 +633,7 @@ app.get("/users/:userId", requireApiKey, requireRelaySignature, async (req, res)
   }
   try {
     const result = await pool.query(
-      `SELECT user_id, username, display_name, avatar_b64, updated_at
+      `SELECT user_id, username, display_name, avatar_b64, wallet_address, updated_at
        FROM users
        WHERE user_id = $1::uuid
        LIMIT 1`,
@@ -676,18 +698,33 @@ app.put("/users/:userId", requireApiKey, requireRelaySignature, async (req, res)
     avatarParam = trimmed.length ? trimmed : null;
   }
   const insertAvatar = avatarInBody ? avatarParam : null;
+  const walletInBody = req.body && Object.prototype.hasOwnProperty.call(req.body, "wallet_address");
+  let walletParam = null;
+  if (walletInBody) {
+    const raw = req.body.wallet_address;
+    if (typeof raw !== "string") {
+      return res.status(400).json({ error: "invalid_wallet_address", request_id: req.id });
+    }
+    const trimmed = raw.trim();
+    if (trimmed.length > 0 && !ETH_ADDRESS_RE.test(trimmed)) {
+      return res.status(400).json({ error: "invalid_wallet_address", request_id: req.id });
+    }
+    walletParam = trimmed.length ? trimmed : null;
+  }
+  const insertWallet = walletInBody ? walletParam : null;
 
   try {
     const result = await pool.query(
-      `INSERT INTO users (user_id, username, display_name, avatar_b64, updated_at)
-       VALUES ($1::uuid, $2, $3, $4, NOW())
+      `INSERT INTO users (user_id, username, display_name, avatar_b64, wallet_address, updated_at)
+       VALUES ($1::uuid, $2, $3, $4, $5, NOW())
        ON CONFLICT (user_id) DO UPDATE
        SET username = EXCLUDED.username,
            display_name = COALESCE(EXCLUDED.display_name, users.display_name),
-           avatar_b64 = CASE WHEN $5::boolean THEN EXCLUDED.avatar_b64 ELSE users.avatar_b64 END,
+           avatar_b64 = CASE WHEN $6::boolean THEN EXCLUDED.avatar_b64 ELSE users.avatar_b64 END,
+           wallet_address = CASE WHEN $7::boolean THEN EXCLUDED.wallet_address ELSE users.wallet_address END,
            updated_at = NOW()
-       RETURNING user_id, username, display_name, avatar_b64, updated_at`,
-      [userId, normalized, displayName, insertAvatar, avatarInBody]
+       RETURNING user_id, username, display_name, avatar_b64, wallet_address, updated_at`,
+      [userId, normalized, displayName, insertAvatar, insertWallet, avatarInBody, walletInBody]
     );
     return res.json(result.rows[0]);
   } catch (e) {
@@ -1204,6 +1241,19 @@ app.post("/messages", requireApiKey, requireRelaySignature, postMessageLimiter, 
   const m = req.body;
 
   try {
+    const susp = await pool.query(
+      `SELECT suspended FROM users WHERE user_id = $1::uuid LIMIT 1`,
+      [m.sender_id]
+    );
+    if (susp.rowCount > 0 && susp.rows[0].suspended === true) {
+      return res.status(403).json({ error: "sender_suspended", request_id: req.id });
+    }
+  } catch (e) {
+    log("error", "sender_suspend_check", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
+  }
+
+  try {
     const result = await pool.query(
       `INSERT INTO messages
       (message_id, conversation_id, sender_id, recipient_id, pad_id, ciphertext_base64, created_at, received_at)
@@ -1637,6 +1687,41 @@ app.post(
   }
 );
 
+// --- Admin (aggregate metrics only; requires RELAY_ADMIN_TOKEN) ---
+app.get("/admin/summary", requireRelayAdmin, async (req, res) => {
+  try {
+    const users = await pool.query(`SELECT COUNT(*)::int AS c FROM users`);
+    const msgs = await pool.query(`SELECT COUNT(*)::int AS c FROM messages`);
+    const suspended = await pool.query(
+      `SELECT COUNT(*)::int AS c FROM users WHERE suspended = true`
+    );
+    return res.json({
+      request_id: req.id,
+      users: users.rows[0]?.c ?? 0,
+      messages: msgs.rows[0]?.c ?? 0,
+      suspended_users: suspended.rows[0]?.c ?? 0,
+    });
+  } catch (e) {
+    log("error", "admin_summary", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
+  }
+});
+
+app.post("/admin/users/:userId/suspend", requireRelayAdmin, async (req, res) => {
+  const { userId } = req.params;
+  if (!UUID_RE.test(userId)) {
+    return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
+  }
+  const suspended = Boolean(req.body?.suspended);
+  try {
+    await pool.query(`UPDATE users SET suspended = $2 WHERE user_id = $1::uuid`, [userId, suspended]);
+    return res.json({ request_id: req.id, user_id: userId, suspended });
+  } catch (e) {
+    log("error", "admin_suspend", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
+  }
+});
+
 // 404
 app.use((req, res) => {
   res.status(404).json({ error: "not_found", request_id: req.id });
@@ -1705,6 +1790,10 @@ async function ensureUsersTable() {
 async function ensureUsersOptionalColumns() {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_b64 TEXT`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS wallet_address TEXT`);
+  await pool.query(
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended BOOLEAN NOT NULL DEFAULT false`
+  );
 }
 
 async function ensureBadgesTable() {
