@@ -18,6 +18,8 @@ const MAX_CIPHERTEXT_BYTES = 256 * 1024;
 const PAD_BATCH_DEFAULT_TTL_SEC = Number(process.env.PAD_BATCH_DEFAULT_TTL_SEC || 86400);
 const PAD_BATCH_MAX_PADS = Number(process.env.PAD_BATCH_MAX_PADS || 100);
 const PAD_BATCH_SWEEP_INTERVAL_SEC = Number(process.env.PAD_BATCH_SWEEP_INTERVAL_SEC || 3600);
+const AUTH_CHALLENGE_TTL_SEC = Number(process.env.AUTH_CHALLENGE_TTL_SEC || 120);
+const AUTH_CODE_TTL_SEC = Number(process.env.AUTH_CODE_TTL_SEC || 180);
 
 const DATABASE_URL = process.env.DATABASE_URL;
 const RELAY_API_KEY = process.env.RELAY_API_KEY?.trim();
@@ -345,6 +347,18 @@ const UUID_RE =
 const USERNAME_RE = /^[a-z0-9_]{3,24}$/;
 const ETH_ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/;
 const KEY_TYPE_X25519 = "x25519";
+const AUTH_TOKEN_RE = /^[A-Za-z0-9_-]{16,200}$/;
+const AUTH_CONNECT_ICONS = [
+  "star.fill",
+  "moon.fill",
+  "bolt.fill",
+  "heart.fill",
+  "flame.fill",
+  "leaf.fill",
+  "drop.fill",
+  "crown.fill",
+  "diamond.fill",
+];
 
 function isIsoDate(value) {
   return typeof value === "string" && !Number.isNaN(Date.parse(value));
@@ -475,6 +489,46 @@ function makePadBatchToken() {
   return `VP-${a}-${b}`;
 }
 
+function makeAuthToken(bytes = 24) {
+  return base64UrlEncode(crypto.randomBytes(bytes));
+}
+
+function validateRedirectURI(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > 2048) return null;
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol === "https:") return url.toString();
+    if (url.protocol === "http:" && (url.hostname === "localhost" || url.hostname === "127.0.0.1")) {
+      return url.toString();
+    }
+  } catch {}
+  return null;
+}
+
+function normalizeAuthOrigin(raw, redirectURI) {
+  if (typeof raw === "string" && raw.trim().length > 0) {
+    return raw.trim().slice(0, 160);
+  }
+  try {
+    return new URL(redirectURI).host.slice(0, 160);
+  } catch {
+    return "unknown";
+  }
+}
+
+function makeEmojiChallengeIcons() {
+  const pool = [...AUTH_CONNECT_ICONS];
+  const icons = [];
+  while (pool.length > 0 && icons.length < 3) {
+    const idx = Math.floor(Math.random() * pool.length);
+    icons.push(pool.splice(idx, 1)[0]);
+  }
+  const correctIcon = icons[Math.floor(Math.random() * icons.length)] || AUTH_CONNECT_ICONS[0];
+  return { icons, correctIcon };
+}
+
 function validatePadBatchBody(body) {
   if (!body || typeof body !== "object") return "invalid_body";
   if (!UUID_RE.test(body.conversation_id)) return "invalid_conversation_id";
@@ -549,6 +603,15 @@ async function sweepExpiredPadBatches() {
   }
 }
 
+async function sweepExpiredAuthArtifacts() {
+  try {
+    await pool.query(`DELETE FROM auth_codes WHERE expires_at < NOW() OR consumed_at IS NOT NULL`);
+    await pool.query(`DELETE FROM auth_challenges WHERE expires_at < NOW()`);
+  } catch (e) {
+    log("error", "sweep_auth_artifacts_failed", { message: e.message });
+  }
+}
+
 // --- Routes ---
 
 app.get("/", (_req, res) => {
@@ -576,6 +639,234 @@ app.get("/readyz", async (req, res) => {
       error: "database_unavailable",
       request_id: req.id,
     });
+  }
+});
+
+app.post("/auth/challenges", requireApiKey, requireRelaySignature, async (req, res) => {
+  const username = normalizeUsername(req.body?.username);
+  const redirectURI = validateRedirectURI(req.body?.redirect_uri);
+  const state = typeof req.body?.state === "string" ? req.body.state.trim().slice(0, 512) : "";
+  if (!username) {
+    return res.status(400).json({ error: "invalid_username", request_id: req.id });
+  }
+  if (!redirectURI) {
+    return res.status(400).json({ error: "invalid_redirect_uri", request_id: req.id });
+  }
+  const origin = normalizeAuthOrigin(req.body?.origin, redirectURI);
+  const { icons, correctIcon } = makeEmojiChallengeIcons();
+  const challengeId = makeAuthToken();
+  const expiresAt = new Date(Date.now() + AUTH_CHALLENGE_TTL_SEC * 1000).toISOString();
+
+  try {
+    const user = await pool.query(
+      `SELECT user_id
+       FROM users
+       WHERE username = $1
+       LIMIT 1`,
+      [username]
+    );
+    if (user.rowCount === 0) {
+      return res.status(404).json({ error: "user_not_found", request_id: req.id });
+    }
+
+    await pool.query(
+      `INSERT INTO auth_challenges (
+         challenge_id, user_id, origin, redirect_uri, client_state,
+         icons_json, correct_icon, status, expires_at
+       ) VALUES ($1, $2::uuid, $3, $4, $5, $6::jsonb, $7, 'pending', $8::timestamptz)`,
+      [challengeId, user.rows[0].user_id, origin, redirectURI, state, JSON.stringify(icons), correctIcon, expiresAt]
+    );
+
+    return res.status(201).json({
+      challenge_id: challengeId,
+      user_id: user.rows[0].user_id,
+      origin,
+      icons,
+      correct_icon: correctIcon,
+      expires_at: expiresAt,
+      request_id: req.id,
+    });
+  } catch (e) {
+    log("error", "create_auth_challenge_db", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
+  }
+});
+
+app.get("/auth/challenges/:challengeId", requireApiKey, requireRelaySignature, async (req, res) => {
+  const challengeId = String(req.params.challengeId || "").trim();
+  if (!AUTH_TOKEN_RE.test(challengeId)) {
+    return res.status(400).json({ error: "invalid_challenge_id", request_id: req.id });
+  }
+  try {
+    const r = await pool.query(
+      `SELECT challenge_id, user_id, origin, redirect_uri, client_state, icons_json, status, expires_at
+       FROM auth_challenges
+       WHERE challenge_id = $1
+       LIMIT 1`,
+      [challengeId]
+    );
+    if (r.rowCount === 0) {
+      return res.status(404).json({ error: "challenge_not_found", request_id: req.id });
+    }
+    const row = r.rows[0];
+    if (new Date(row.expires_at).getTime() <= Date.now()) {
+      return res.status(410).json({ error: "challenge_expired", request_id: req.id });
+    }
+    if (row.status !== "pending") {
+      return res.status(409).json({ error: "challenge_resolved", status: row.status, request_id: req.id });
+    }
+    return res.json({
+      challenge_id: row.challenge_id,
+      user_id: row.user_id,
+      origin: row.origin,
+      redirect_uri: row.redirect_uri,
+      state: row.client_state || "",
+      icons: Array.isArray(row.icons_json) ? row.icons_json : [],
+      expires_at: row.expires_at,
+      request_id: req.id,
+    });
+  } catch (e) {
+    log("error", "get_auth_challenge_db", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
+  }
+});
+
+app.post("/auth/challenges/:challengeId/approve", requireApiKey, requireRelaySignature, async (req, res) => {
+  const challengeId = String(req.params.challengeId || "").trim();
+  const userId = String(req.body?.user_id || "").trim();
+  const selectedIcon = typeof req.body?.selected_icon === "string" ? req.body.selected_icon.trim() : "";
+  if (!AUTH_TOKEN_RE.test(challengeId)) {
+    return res.status(400).json({ error: "invalid_challenge_id", request_id: req.id });
+  }
+  if (!UUID_RE.test(userId)) {
+    return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
+  }
+  if (!AUTH_CONNECT_ICONS.includes(selectedIcon)) {
+    return res.status(400).json({ error: "invalid_selected_icon", request_id: req.id });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const r = await client.query(
+      `SELECT challenge_id, user_id, redirect_uri, client_state, correct_icon, status, expires_at
+       FROM auth_challenges
+       WHERE challenge_id = $1
+       LIMIT 1
+       FOR UPDATE`,
+      [challengeId]
+    );
+    if (r.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "challenge_not_found", request_id: req.id });
+    }
+    const row = r.rows[0];
+    if (String(row.user_id).toLowerCase() !== userId.toLowerCase()) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "challenge_user_mismatch", request_id: req.id });
+    }
+    if (new Date(row.expires_at).getTime() <= Date.now()) {
+      await client.query("ROLLBACK");
+      return res.status(410).json({ error: "challenge_expired", request_id: req.id });
+    }
+    if (row.status !== "pending") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "challenge_resolved", status: row.status, request_id: req.id });
+    }
+
+    if (selectedIcon !== row.correct_icon) {
+      await client.query(
+        `UPDATE auth_challenges
+         SET status = 'rejected', selected_icon = $2, resolved_at = NOW()
+         WHERE challenge_id = $1`,
+        [challengeId, selectedIcon]
+      );
+      await client.query("COMMIT");
+      return res.json({ result: "rejected", request_id: req.id });
+    }
+
+    const code = makeAuthToken();
+    const codeExpiresAt = new Date(Date.now() + AUTH_CODE_TTL_SEC * 1000).toISOString();
+    await client.query(
+      `INSERT INTO auth_codes (code, challenge_id, user_id, expires_at)
+       VALUES ($1, $2, $3::uuid, $4::timestamptz)`,
+      [code, challengeId, userId, codeExpiresAt]
+    );
+    await client.query(
+      `UPDATE auth_challenges
+       SET status = 'approved',
+           selected_icon = $2,
+           approved_at = NOW(),
+           resolved_at = NOW()
+       WHERE challenge_id = $1`,
+      [challengeId, selectedIcon]
+    );
+    await client.query("COMMIT");
+    return res.json({
+      result: "approved",
+      code,
+      redirect_uri: row.redirect_uri,
+      state: row.client_state || "",
+      expires_at: codeExpiresAt,
+      request_id: req.id,
+    });
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    log("error", "approve_auth_challenge_db", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/auth/token", requireApiKey, requireRelaySignature, async (req, res) => {
+  const code = String(req.body?.code || "").trim();
+  if (!AUTH_TOKEN_RE.test(code)) {
+    return res.status(400).json({ error: "invalid_code", request_id: req.id });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const r = await client.query(
+      `SELECT c.code, c.challenge_id, c.user_id, c.expires_at, c.consumed_at,
+              ch.origin, ch.client_state
+       FROM auth_codes c
+       JOIN auth_challenges ch ON ch.challenge_id = c.challenge_id
+       WHERE c.code = $1
+       LIMIT 1
+       FOR UPDATE`,
+      [code]
+    );
+    if (r.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "code_not_found", request_id: req.id });
+    }
+    const row = r.rows[0];
+    if (row.consumed_at) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "code_already_used", request_id: req.id });
+    }
+    if (new Date(row.expires_at).getTime() <= Date.now()) {
+      await client.query("ROLLBACK");
+      return res.status(410).json({ error: "code_expired", request_id: req.id });
+    }
+
+    await client.query(`UPDATE auth_codes SET consumed_at = NOW() WHERE code = $1`, [code]);
+    await client.query(`UPDATE auth_challenges SET status = 'consumed' WHERE challenge_id = $1`, [row.challenge_id]);
+    await client.query("COMMIT");
+    return res.json({
+      user_id: row.user_id,
+      challenge_id: row.challenge_id,
+      origin: row.origin,
+      state: row.client_state || "",
+      request_id: req.id,
+    });
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    log("error", "exchange_auth_code_db", { message: e.message, request_id: req.id });
+    return res.status(500).json({ error: "db_error", request_id: req.id });
+  } finally {
+    client.release();
   }
 });
 
@@ -1951,6 +2242,51 @@ async function ensureInitialX3DHMessagesTable() {
   );
 }
 
+async function ensureAuthChallengesTable() {
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS auth_challenges (
+      challenge_id TEXT PRIMARY KEY,
+      user_id UUID NOT NULL,
+      origin TEXT NOT NULL,
+      redirect_uri TEXT NOT NULL,
+      client_state TEXT,
+      icons_json JSONB NOT NULL,
+      correct_icon TEXT NOT NULL,
+      selected_icon TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      approved_at TIMESTAMPTZ,
+      resolved_at TIMESTAMPTZ
+    )`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_auth_challenges_user_expires
+     ON auth_challenges (user_id, expires_at DESC)`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_auth_challenges_status_expires
+     ON auth_challenges (status, expires_at DESC)`
+  );
+}
+
+async function ensureAuthCodesTable() {
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS auth_codes (
+      code TEXT PRIMARY KEY,
+      challenge_id TEXT NOT NULL REFERENCES auth_challenges(challenge_id) ON DELETE CASCADE,
+      user_id UUID NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      consumed_at TIMESTAMPTZ
+    )`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_auth_codes_challenge
+     ON auth_codes (challenge_id, expires_at DESC)`
+  );
+}
+
 // ─── WebSocket signaling for encrypted calls ───────────────────────────
 const WebSocket = require("ws");
 
@@ -2257,10 +2593,14 @@ async function bootstrap() {
   await ensureIdentityKeysTable();
   await ensurePrekeysTable();
   await ensureInitialX3DHMessagesTable();
+  await ensureAuthChallengesTable();
+  await ensureAuthCodesTable();
   await ensureMessagesDeliveredAt();
   await ensurePushDevicesTable();
   await sweepExpiredPadBatches();
+  await sweepExpiredAuthArtifacts();
   setInterval(sweepExpiredPadBatches, PAD_BATCH_SWEEP_INTERVAL_SEC * 1000).unref();
+  setInterval(sweepExpiredAuthArtifacts, PAD_BATCH_SWEEP_INTERVAL_SEC * 1000).unref();
   server = app.listen(PORT, () => {
     log("info", "listen", {
       port: PORT,
