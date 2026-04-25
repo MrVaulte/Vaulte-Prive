@@ -2698,7 +2698,10 @@ const gasDepositIntentSchema = z.object({
 const gasDepositConfirmSchema = z.object({
   chain: z.enum(["evm", "base"]),
   owner_address: z.string(),
-  tx_hash: z.string().regex(/^0x[0-9a-fA-F]{64}$/),
+  tx_hash: z.string()
+    .trim()
+    .regex(/^(0x)?[0-9a-fA-F]{64}$/)
+    .transform((value) => value.startsWith("0x") ? value : `0x${value}`),
 });
 
 function installGasRelayRoutes(app, options = {}) {
