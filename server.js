@@ -2634,3 +2634,269 @@ function shutdown(signal) {
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
+const { ethers } = require("ethers");
+const { z } = require("zod");
+
+const ERC20_ABI = [
+  "function balanceOf(address owner) view returns (uint256)",
+  "function decimals() view returns (uint8)",
+  "function symbol() view returns (string)",
+];
+
+const SUPPORTED_GAS_RELAY_TOKENS = {
+  evm: {
+    chainId: 1n,
+    networkName: "Ethereum",
+    depositAddressEnv: "ETH_GAS_DEPOSIT_ADDRESS",
+    privateKeyEnv: "ETH_TREASURY_PRIVATE_KEY",
+    rpcEnv: "ETH_RPC_URL",
+    maxTopUpWeiEnv: "ETH_MAX_TOPUP_WEI",
+    defaultMaxTopUpWei: 6_000_000_000_000_000n,
+    tokens: new Map([
+      ["0xdac17f958d2ee523a2206206994597c13d831ec7", "USDT"],
+      ["0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "USDC"],
+    ]),
+  },
+  base: {
+    chainId: 8453n,
+    networkName: "Base",
+    depositAddressEnv: "BASE_GAS_DEPOSIT_ADDRESS",
+    privateKeyEnv: "BASE_TREASURY_PRIVATE_KEY",
+    rpcEnv: "BASE_RPC_URL",
+    maxTopUpWeiEnv: "BASE_MAX_TOPUP_WEI",
+    defaultMaxTopUpWei: 800_000_000_000_000n,
+    tokens: new Map([
+      ["0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", "USDC"],
+    ]),
+  },
+};
+
+const gasTopUpSchema = z.object({
+  chain: z.enum(["evm", "base"]),
+  chain_id: z.string().regex(/^\d+$/),
+  receive_address: z.string(),
+  destination_address: z.string(),
+  token_symbol: z.string().min(2).max(16),
+  token_contract: z.string(),
+  token_balance_units: z.string().regex(/^\d+$/),
+  estimated_gas_wei: z.string().regex(/^\d+$/),
+  requested_top_up_wei: z.string().regex(/^\d+$/),
+  client_request_id: z.string().min(8).max(128),
+});
+
+const gasDepositIntentSchema = z.object({
+  chain: z.enum(["evm", "base"]),
+  suggested_usd_amount: z.number().min(1).max(1000).optional(),
+});
+
+function installGasRelayRoutes(app, options = {}) {
+  const requireApiKey = options.requireApiKey || ((_req, _res, next) => next());
+  const requireRelaySignature = options.requireRelaySignature || ((_req, _res, next) => next());
+  const log = options.log || (() => {});
+
+  const providers = new Map();
+  const wallets = new Map();
+  const topUpCooldowns = new Map();
+  const idempotency = new Map();
+
+  app.post("/gas/deposit-intents", requireApiKey, requireRelaySignature, (req, res) => {
+    const parsed = gasDepositIntentSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: "invalid_request",
+        details: parsed.error.flatten(),
+        request_id: req.id,
+      });
+    }
+
+    const config = SUPPORTED_GAS_RELAY_TOKENS[parsed.data.chain];
+    const address = process.env[config.depositAddressEnv];
+    if (!address || !ethers.isAddress(address)) {
+      return res.status(503).json({
+        error: "deposit_address_unavailable",
+        message: `${config.depositAddressEnv} is not configured.`,
+        request_id: req.id,
+      });
+    }
+
+    return res.json({
+      chain: parsed.data.chain,
+      network_name: config.networkName,
+      address: ethers.getAddress(address),
+      recommended_usd_amount: Number(process.env.GAS_CREDIT_RECOMMENDED_USD || 20),
+      min_usd_amount: Number(process.env.GAS_CREDIT_MIN_USD || 5),
+      memo: "Send only native gas token on this network. Do not send USDT/USDC.",
+      request_id: req.id,
+    });
+  });
+
+  app.post("/gas/topups", requireApiKey, requireRelaySignature, async (req, res) => {
+    const parsed = gasTopUpSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: "invalid_request",
+        details: parsed.error.flatten(),
+        request_id: req.id,
+      });
+    }
+
+    try {
+      const result = await handleTopUp(parsed.data, {
+        providers,
+        wallets,
+        topUpCooldowns,
+        idempotency,
+        log,
+      });
+      return res.json({ ...result, request_id: req.id });
+    } catch (error) {
+      const status = error.statusCode || 500;
+      log(status >= 500 ? "error" : "warn", "gas_relay_topup_failed", {
+        code: error.code,
+        message: error.message,
+        request_id: req.id,
+      });
+      return res.status(status).json({
+        error: error.code || "relay_error",
+        message: error.message || "Vaulté gas relay failed.",
+        request_id: req.id,
+      });
+    }
+  });
+}
+
+async function handleTopUp(input, state) {
+  const config = SUPPORTED_GAS_RELAY_TOKENS[input.chain];
+  if (BigInt(input.chain_id) !== config.chainId) {
+    throw httpError(400, "wrong_chain", "chain_id does not match requested chain.");
+  }
+
+  const receiveAddress = checkedAddress(input.receive_address, "receive_address");
+  const destinationAddress = checkedAddress(input.destination_address, "destination_address");
+  const tokenContract = checkedAddress(input.token_contract, "token_contract").toLowerCase();
+  const supportedSymbol = config.tokens.get(tokenContract);
+  if (!supportedSymbol || supportedSymbol !== input.token_symbol.toUpperCase()) {
+    throw httpError(400, "unsupported_token", "Token is not supported by Vaulté gas relay.");
+  }
+
+  const requestedTopUp = BigInt(input.requested_top_up_wei);
+  const maxTopUp = envBigInt(config.maxTopUpWeiEnv, config.defaultMaxTopUpWei);
+  if (requestedTopUp <= 0n || requestedTopUp > maxTopUp) {
+    throw httpError(400, "topup_out_of_bounds", `Requested top-up exceeds relay cap for ${config.networkName}.`);
+  }
+
+  const cooldownKey = `${input.chain}:${receiveAddress.toLowerCase()}`;
+  enforceCooldown(cooldownKey, state.topUpCooldowns);
+
+  if (state.idempotency.has(input.client_request_id)) {
+    return state.idempotency.get(input.client_request_id);
+  }
+
+  const provider = providerFor(input.chain, state.providers);
+  const token = new ethers.Contract(tokenContract, ERC20_ABI, provider);
+  const [nativeBalance, tokenBalance] = await Promise.all([
+    provider.getBalance(receiveAddress),
+    token.balanceOf(receiveAddress),
+  ]);
+
+  const reportedTokenBalance = BigInt(input.token_balance_units);
+  if (tokenBalance <= 0n || tokenBalance < reportedTokenBalance) {
+    throw httpError(409, "token_balance_not_confirmed", "Relay could not confirm the reported ERC-20 balance on-chain yet.");
+  }
+
+  const estimatedGas = BigInt(input.estimated_gas_wei);
+  if (nativeBalance >= estimatedGas) {
+    const result = {
+      status: "skipped",
+      message: "One-time address already has enough native gas.",
+    };
+    state.idempotency.set(input.client_request_id, result);
+    return result;
+  }
+
+  const wallet = walletFor(input.chain, state.providers, state.wallets);
+  const treasuryBalance = await provider.getBalance(wallet.address);
+  const feeData = await provider.getFeeData();
+  const gasPrice = feeData.gasPrice || 1_000_000_000n;
+  const relayFee = 21_000n * gasPrice;
+  if (treasuryBalance < requestedTopUp + relayFee) {
+    throw httpError(503, "treasury_empty", `${config.networkName} gas treasury needs funding.`);
+  }
+
+  const tx = await wallet.sendTransaction({
+    to: receiveAddress,
+    value: requestedTopUp,
+  });
+
+  state.topUpCooldowns.set(cooldownKey, Date.now());
+  const result = {
+    status: "funded",
+    tx_hash: tx.hash,
+    chain: input.chain,
+    receive_address: receiveAddress,
+    destination_address: destinationAddress,
+    funded_wei: requestedTopUp.toString(),
+  };
+  state.idempotency.set(input.client_request_id, result);
+  return result;
+}
+
+function providerFor(chain, providers) {
+  if (providers.has(chain)) return providers.get(chain);
+  const config = SUPPORTED_GAS_RELAY_TOKENS[chain];
+  const rpcURL = process.env[config.rpcEnv];
+  if (!rpcURL) {
+    throw httpError(503, "rpc_not_configured", `${config.rpcEnv} is required.`);
+  }
+  const provider = new ethers.JsonRpcProvider(rpcURL, Number(config.chainId));
+  providers.set(chain, provider);
+  return provider;
+}
+
+function walletFor(chain, providers, wallets) {
+  if (wallets.has(chain)) return wallets.get(chain);
+  const config = SUPPORTED_GAS_RELAY_TOKENS[chain];
+  const privateKey = process.env[config.privateKeyEnv];
+  if (!privateKey) {
+    throw httpError(503, "treasury_not_configured", `${config.privateKeyEnv} is required.`);
+  }
+  const wallet = new ethers.Wallet(privateKey, providerFor(chain, providers));
+  wallets.set(chain, wallet);
+  return wallet;
+}
+
+function checkedAddress(value, field) {
+  if (!ethers.isAddress(value)) {
+    throw httpError(400, "invalid_address", `${field} is not a valid EVM address.`);
+  }
+  return ethers.getAddress(value);
+}
+
+function enforceCooldown(key, topUpCooldowns) {
+  const cooldownMs = Number(process.env.TOPUP_COOLDOWN_SECONDS || 180) * 1000;
+  const last = topUpCooldowns.get(key);
+  if (last && Date.now() - last < cooldownMs) {
+    throw httpError(429, "topup_cooldown", "Top-up for this one-time address is cooling down.");
+  }
+}
+
+function envBigInt(name, fallback) {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  try {
+    return BigInt(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+function httpError(statusCode, code, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.code = code;
+  return error;
+}
+
+module.exports = {
+  installGasRelayRoutes,
+};
