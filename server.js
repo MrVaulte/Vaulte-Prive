@@ -2,7 +2,6 @@
  * Vaulte Privé relay — production-oriented opaque message store.
  * Never decrypts ciphertext; validates shape + anti-plaintext heuristic only.
  */
-
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
@@ -620,6 +619,12 @@ app.get("/", (_req, res) => {
 
 app.get("/healthz", async (_req, res) => {
   res.json({ ok: true, request_id: _req.id });
+});
+
+installGasRelayRoutes(app, {
+  log,
+  requireApiKey,
+  requireRelaySignature,
 });
 
 /** Deep health: DB must respond (use for orchestrator / manual checks). */
@@ -2011,6 +2016,12 @@ app.post("/admin/users/:userId/suspend", requireRelayAdmin, async (req, res) => 
     log("error", "admin_suspend", { message: e.message, request_id: req.id });
     return res.status(500).json({ error: "db_error", request_id: req.id });
   }
+});
+
+installGasRelayRoutes(app, {
+  requireApiKey,
+  requireRelaySignature,
+  log,
 });
 
 // 404
