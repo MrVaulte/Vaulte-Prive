@@ -2736,31 +2736,32 @@ function installGasRelayRoutes(app, options = {}) {
       });
     }
 
-    try {
-      const gasBalance = await gasCreditStatus(
-        parsed.data.chain,
-        parsed.data.owner_address,
-        gasCredits
-      );
-
-      return res.json({
+    const gasBalance = await gasCreditStatus(
+      parsed.data.chain,
+      parsed.data.owner_address,
+      gasCredits
+    ).catch((error) => {
+      log("warn", "gas_credit_status_unavailable", {
         chain: parsed.data.chain,
-        network_name: config.networkName,
-        address: ethers.getAddress(address),
-        recommended_usd_amount: Number(process.env.GAS_CREDIT_RECOMMENDED_USD || 20),
-        min_usd_amount: Number(process.env.GAS_CREDIT_MIN_USD || 5),
-        memo: "Send only native gas token on this network. Do not send USDT/USDC.",
-        ...gasBalance,
+        message: error.message,
         request_id: req.id,
       });
-    } catch (error) {
-      const status = error.statusCode || 500;
-      return res.status(status).json({
-        error: error.code || "deposit_intent_failed",
-        message: error.message || "Vaulté could not prepare this deposit intent.",
-        request_id: req.id,
-      });
-    }
+      return {
+        gas_balance_status: "unavailable",
+        gas_balance_message: error.message || "Gas balance is unavailable.",
+      };
+    });
+
+    return res.json({
+      chain: parsed.data.chain,
+      network_name: config.networkName,
+      address: ethers.getAddress(address),
+      recommended_usd_amount: Number(process.env.GAS_CREDIT_RECOMMENDED_USD || 20),
+      min_usd_amount: Number(process.env.GAS_CREDIT_MIN_USD || 5),
+      memo: "Send only native gas token on this network. Do not send USDT/USDC.",
+      ...gasBalance,
+      request_id: req.id,
+    });
   });
 
   app.post("/gas/deposits/confirm", requireApiKey, requireRelaySignature, async (req, res) => {
@@ -2781,6 +2782,11 @@ function installGasRelayRoutes(app, options = {}) {
       return res.json({ ...result, request_id: req.id });
     } catch (error) {
       const status = error.statusCode || 500;
+      log(status >= 500 ? "error" : "warn", "gas_deposit_confirm_failed", {
+        code: error.code,
+        message: error.message,
+        request_id: req.id,
+      });
       return res.status(status).json({
         error: error.code || "deposit_confirm_failed",
         message: error.message || "Vaulté could not confirm this deposit.",
@@ -2882,7 +2888,7 @@ async function handleTopUp(input, state) {
   const creditDebit = requestedTopUp + relayFee;
   const ownerCredit = creditBalance(input.chain, destinationAddress, state.gasCredits);
   if (ownerCredit < creditDebit) {
-    throw httpError(402, "gas_credit_empty", "Gas Credit is too low.");
+    throw httpError(402, "gas_credit_empty", `${config.networkName} Gas Credit is too low. Top up and confirm your deposit first.`);
   }
   if (treasuryBalance < requestedTopUp + relayFee) {
     throw httpError(503, "treasury_empty", `${config.networkName} gas treasury needs funding.`);
@@ -2907,35 +2913,74 @@ async function handleTopUp(input, state) {
   return result;
 }
 
+async function gasCreditStatus(chain, ownerAddress, gasCredits) {
+  const config = SUPPORTED_GAS_RELAY_TOKENS[chain];
+  if (!ownerAddress || !ethers.isAddress(ownerAddress)) {
+    return {
+      gas_balance_status: "unavailable",
+      gas_balance_message: "Open this from a wallet address to see your personal Gas Credit.",
+    };
+  }
+  const owner = ethers.getAddress(ownerAddress);
+  const balanceWei = creditBalance(chain, owner, gasCredits);
+  const estimatedOperationWei = envBigInt(
+    chain === "base" ? "BASE_ESTIMATED_GAS_OPERATION_WEI" : "ETH_ESTIMATED_GAS_OPERATION_WEI",
+    config.defaultMaxTopUpWei
+  );
+  const estimatedOperations = estimatedOperationWei > 0n
+    ? Number(balanceWei / estimatedOperationWei)
+    : 0;
+
+  return {
+    gas_balance_status: "ok",
+    gas_balance_wei: balanceWei.toString(),
+    gas_balance_native: ethers.formatEther(balanceWei),
+    estimated_operation_wei: estimatedOperationWei.toString(),
+    estimated_operations: estimatedOperations,
+  };
+}
+
 async function confirmGasDeposit(input, state) {
   const config = SUPPORTED_GAS_RELAY_TOKENS[input.chain];
   const owner = checkedAddress(input.owner_address, "owner_address");
-  const rawDepositAddress = process.env[config.depositAddressEnv];
-  if (!rawDepositAddress || !ethers.isAddress(rawDepositAddress)) {
+  const depositAddress = process.env[config.depositAddressEnv];
+  if (!depositAddress || !ethers.isAddress(depositAddress)) {
     throw httpError(503, "deposit_address_unavailable", `${config.depositAddressEnv} is not configured.`);
   }
-  const depositAddress = ethers.getAddress(rawDepositAddress);
+
   const provider = providerFor(input.chain, state.providers);
   const tx = await provider.getTransaction(input.tx_hash);
-  if (!tx) throw httpError(404, "deposit_not_found", "Deposit not found yet.");
+  if (!tx) {
+    throw httpError(404, "deposit_not_found", "Vaulté could not find this transaction on-chain yet.");
+  }
   const receipt = await provider.getTransactionReceipt(input.tx_hash);
   if (!receipt || receipt.status !== 1) {
-    throw httpError(409, "deposit_not_confirmed", "Deposit is not confirmed yet.");
+    throw httpError(409, "deposit_not_confirmed", "This deposit transaction is not confirmed yet.");
   }
   if (!tx.from || tx.from.toLowerCase() !== owner.toLowerCase()) {
-    throw httpError(400, "wrong_depositor", "Deposit was not sent from your wallet.");
+    throw httpError(400, "wrong_depositor", "This deposit was not sent from your wallet address.");
   }
-  if (!tx.to || tx.to.toLowerCase() !== depositAddress.toLowerCase()) {
-    throw httpError(400, "wrong_deposit_address", "Wrong deposit address.");
+  if (!tx.to || tx.to.toLowerCase() !== ethers.getAddress(depositAddress).toLowerCase()) {
+    throw httpError(400, "wrong_deposit_address", "This transaction was not sent to the Vaulté gas top-up address.");
   }
+  if (tx.value <= 0n) {
+    throw httpError(400, "empty_deposit", "Deposit value is zero.");
+  }
+
   const depositKey = `${input.chain}:${input.tx_hash.toLowerCase()}`;
   if (!state.creditedDeposits.has(depositKey)) {
     state.creditedDeposits.add(depositKey);
     addCredit(input.chain, owner, tx.value, state.gasCredits);
   }
+
   return {
     status: "credited",
     chain: input.chain,
+    network_name: config.networkName,
+    address: ethers.getAddress(depositAddress),
+    recommended_usd_amount: Number(process.env.GAS_CREDIT_RECOMMENDED_USD || 20),
+    min_usd_amount: Number(process.env.GAS_CREDIT_MIN_USD || 5),
+    memo: "Send only native gas token on this network. Do not send USDT/USDC.",
     owner_address: owner,
     credited_wei: tx.value.toString(),
     ...await gasCreditStatus(input.chain, owner, state.gasCredits),
@@ -2990,20 +3035,6 @@ function debitCredit(chain, ownerAddress, amountWei, gasCredits) {
   const key = creditKey(chain, ownerAddress);
   const current = gasCredits.get(key) || 0n;
   gasCredits.set(key, current > amountWei ? current - amountWei : 0n);
-}
-
-async function gasCreditStatus(chain, ownerAddress, gasCredits) {
-  if (!ownerAddress) {
-    return {
-      owner_address: null,
-      gas_credit_wei: "0",
-    };
-  }
-  const owner = checkedAddress(ownerAddress, "owner_address");
-  return {
-    owner_address: owner,
-    gas_credit_wei: creditBalance(chain, owner, gasCredits).toString(),
-  };
 }
 
 function enforceCooldown(key, topUpCooldowns) {
