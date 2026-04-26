@@ -4,6 +4,8 @@
  */
 const express = require("express");
 const cors = require("cors");
+const { ethers } = require("ethers");
+const { z } = require("zod");
 const { Pool } = require("pg");
 const rateLimit = require("express-rate-limit");
 const crypto = require("crypto");
@@ -734,22 +736,34 @@ app.post("/auth/challenges/:challengeId/approve", requireApiKey, requireRelaySig
   const challengeId = String(req.params.challengeId || "").trim();
   const userId = String(req.body?.user_id || "").trim();
   const selectedIcon = typeof req.body?.selected_icon === "string" ? req.body.selected_icon.trim() : "";
+  const result = typeof req.body?.result === "string" ? req.body.result.trim().toLowerCase() : "";
+  const walletAddress = typeof req.body?.wallet_address === "string" ? req.body.wallet_address.trim() : "";
+  const signedMessage = typeof req.body?.signed_message === "string" ? req.body.signed_message : "";
+  const signature = typeof req.body?.signature === "string" ? req.body.signature.trim() : "";
   if (!AUTH_TOKEN_RE.test(challengeId)) {
     return res.status(400).json({ error: "invalid_challenge_id", request_id: req.id });
   }
-  if (!UUID_RE.test(userId)) {
+  if (userId && !UUID_RE.test(userId)) {
     return res.status(400).json({ error: "invalid_user_id", request_id: req.id });
   }
-  if (!AUTH_CONNECT_ICONS.includes(selectedIcon)) {
+  if (selectedIcon && !AUTH_CONNECT_ICONS.includes(selectedIcon)) {
     return res.status(400).json({ error: "invalid_selected_icon", request_id: req.id });
+  }
+  if (!selectedIcon && result !== "cancelled") {
+    return res.status(400).json({ error: "invalid_selected_icon", request_id: req.id });
+  }
+  if (result && !["approved", "rejected", "cancelled"].includes(result)) {
+    return res.status(400).json({ error: "invalid_result", request_id: req.id });
   }
 
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     const r = await client.query(
-      `SELECT challenge_id, user_id, redirect_uri, client_state, correct_icon, status, expires_at
-       FROM auth_challenges
+      `SELECT ch.challenge_id, ch.user_id, ch.redirect_uri, ch.client_state, ch.correct_icon, ch.status, ch.expires_at,
+              u.wallet_address
+       FROM auth_challenges ch
+       LEFT JOIN users u ON u.user_id = ch.user_id
        WHERE challenge_id = $1
        LIMIT 1
        FOR UPDATE`,
@@ -760,7 +774,7 @@ app.post("/auth/challenges/:challengeId/approve", requireApiKey, requireRelaySig
       return res.status(404).json({ error: "challenge_not_found", request_id: req.id });
     }
     const row = r.rows[0];
-    if (String(row.user_id).toLowerCase() !== userId.toLowerCase()) {
+    if (userId && String(row.user_id).toLowerCase() !== userId.toLowerCase()) {
       await client.query("ROLLBACK");
       return res.status(403).json({ error: "challenge_user_mismatch", request_id: req.id });
     }
@@ -773,7 +787,18 @@ app.post("/auth/challenges/:challengeId/approve", requireApiKey, requireRelaySig
       return res.status(409).json({ error: "challenge_resolved", status: row.status, request_id: req.id });
     }
 
-    if (selectedIcon !== row.correct_icon) {
+    if (result === "cancelled") {
+      await client.query(
+        `UPDATE auth_challenges
+         SET status = 'cancelled', resolved_at = NOW()
+         WHERE challenge_id = $1`,
+        [challengeId]
+      );
+      await client.query("COMMIT");
+      return res.json({ result: "cancelled", request_id: req.id });
+    }
+
+    if (result === "rejected" || selectedIcon !== row.correct_icon) {
       await client.query(
         `UPDATE auth_challenges
          SET status = 'rejected', selected_icon = $2, resolved_at = NOW()
@@ -784,12 +809,54 @@ app.post("/auth/challenges/:challengeId/approve", requireApiKey, requireRelaySig
       return res.json({ result: "rejected", request_id: req.id });
     }
 
+    const stateText = String(row.client_state || "");
+    const linkMode = stateText.includes("mode=link");
+    const walletApproval = !!(walletAddress || signedMessage || signature);
+    if (walletApproval) {
+      if (!walletAddress || !ethers.isAddress(walletAddress)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "invalid_wallet_address", request_id: req.id });
+      }
+      if (!signedMessage || !signature) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "missing_wallet_signature", request_id: req.id });
+      }
+
+      const normalizedWalletAddress = ethers.getAddress(walletAddress);
+      let recoveredAddress;
+      try {
+        recoveredAddress = ethers.verifyMessage(signedMessage, signature);
+      } catch {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "invalid_wallet_signature", request_id: req.id });
+      }
+
+      if (!recoveredAddress || ethers.getAddress(recoveredAddress) !== normalizedWalletAddress) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ error: "wallet_signature_mismatch", request_id: req.id });
+      }
+      if (!signedMessage.includes(`Challenge ID: ${challengeId}`) || !signedMessage.includes(`Selected Emoji: ${selectedIcon}`)) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ error: "invalid_signed_message", request_id: req.id });
+      }
+      if (!linkMode) {
+        if (!row.wallet_address || !ethers.isAddress(row.wallet_address)) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({ error: "wallet_not_linked", request_id: req.id });
+        }
+        if (ethers.getAddress(row.wallet_address) !== normalizedWalletAddress) {
+          await client.query("ROLLBACK");
+          return res.status(403).json({ error: "wallet_address_mismatch", request_id: req.id });
+        }
+      }
+    }
+
     const code = makeAuthToken();
     const codeExpiresAt = new Date(Date.now() + AUTH_CODE_TTL_SEC * 1000).toISOString();
     await client.query(
       `INSERT INTO auth_codes (code, challenge_id, user_id, expires_at)
        VALUES ($1, $2, $3::uuid, $4::timestamptz)`,
-      [code, challengeId, userId, codeExpiresAt]
+      [code, challengeId, row.user_id, codeExpiresAt]
     );
     await client.query(
       `UPDATE auth_challenges
@@ -804,6 +871,7 @@ app.post("/auth/challenges/:challengeId/approve", requireApiKey, requireRelaySig
     return res.json({
       result: "approved",
       code,
+      user_id: row.user_id,
       redirect_uri: row.redirect_uri,
       state: row.client_state || "",
       expires_at: codeExpiresAt,
@@ -2639,8 +2707,6 @@ function shutdown(signal) {
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
-const { ethers } = require("ethers");
-const { z } = require("zod");
 
 const ERC20_ABI = [
   "function balanceOf(address owner) view returns (uint256)",
@@ -2648,6 +2714,20 @@ const ERC20_ABI = [
   "function symbol() view returns (string)",
 ];
 
+// Two distinct knobs, do NOT confuse them:
+//
+//   defaultMaxTopUpWei         — hard ceiling for a SINGLE relay top-up
+//                                request from the iOS client. Generous on
+//                                purpose, sized to survive a 100 gwei
+//                                base-fee spike without rejecting users.
+//
+//   defaultEstimatedOperationWei — *typical* cost of one privacy sweep at
+//                                today's median gas. Used only by
+//                                `gasCreditStatus` to compute
+//                                `estimated_operations` for the UI. Lower
+//                                than the cap so the "Enough for N ops"
+//                                line in the iOS Top-Up screen reflects
+//                                reality, not the worst-case headroom.
 const SUPPORTED_GAS_RELAY_TOKENS = {
   evm: {
     chainId: 1n,
@@ -2656,7 +2736,8 @@ const SUPPORTED_GAS_RELAY_TOKENS = {
     privateKeyEnv: "ETH_TREASURY_PRIVATE_KEY",
     rpcEnv: "ETH_RPC_URL",
     maxTopUpWeiEnv: "ETH_MAX_TOPUP_WEI",
-    defaultMaxTopUpWei: 6_000_000_000_000_000n,
+    defaultMaxTopUpWei: 6_000_000_000_000_000n,            // 0.006 ETH
+    defaultEstimatedOperationWei: 2_500_000_000_000_000n,  // 0.0025 ETH
     tokens: new Map([
       ["0xdac17f958d2ee523a2206206994597c13d831ec7", "USDT"],
       ["0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "USDC"],
@@ -2669,7 +2750,8 @@ const SUPPORTED_GAS_RELAY_TOKENS = {
     privateKeyEnv: "BASE_TREASURY_PRIVATE_KEY",
     rpcEnv: "BASE_RPC_URL",
     maxTopUpWeiEnv: "BASE_MAX_TOPUP_WEI",
-    defaultMaxTopUpWei: 800_000_000_000_000n,
+    defaultMaxTopUpWei: 800_000_000_000_000n,              // 0.0008 Base ETH
+    defaultEstimatedOperationWei: 300_000_000_000_000n,    // 0.0003 Base ETH
     tokens: new Map([
       ["0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", "USDC"],
     ]),
@@ -2773,6 +2855,7 @@ function installGasRelayRoutes(app, options = {}) {
         request_id: req.id,
       });
     }
+
     try {
       const result = await confirmGasDeposit(parsed.data, {
         providers,
@@ -2829,6 +2912,88 @@ function installGasRelayRoutes(app, options = {}) {
       });
     }
   });
+}
+
+async function gasCreditStatus(chain, ownerAddress, gasCredits) {
+  const config = SUPPORTED_GAS_RELAY_TOKENS[chain];
+  if (!ownerAddress || !ethers.isAddress(ownerAddress)) {
+    return {
+      gas_balance_status: "unavailable",
+      gas_balance_message: "Open this from a wallet address to see your personal Gas Credit.",
+    };
+  }
+  const owner = ethers.getAddress(ownerAddress);
+  const balanceWei = creditBalance(chain, owner, gasCredits);
+  const estimatedOperationWei = envBigInt(
+    chain === "base" ? "BASE_ESTIMATED_GAS_OPERATION_WEI" : "ETH_ESTIMATED_GAS_OPERATION_WEI",
+    config.defaultEstimatedOperationWei
+  );
+  const estimatedOperations = estimatedOperationWei > 0n
+    ? Number(balanceWei / estimatedOperationWei)
+    : 0;
+
+  // How much more the user needs to deposit to unlock the next operation.
+  // Zero when balance already covers ≥1 op. Lets the iOS UI render a
+  // concrete "Top up ~0.001 ETH more" hint instead of a vague "not enough".
+  const shortfallWei = estimatedOperations >= 1 || estimatedOperationWei === 0n
+    ? 0n
+    : estimatedOperationWei - balanceWei;
+
+  return {
+    gas_balance_status: "ok",
+    gas_balance_wei: balanceWei.toString(),
+    gas_balance_native: ethers.formatEther(balanceWei),
+    estimated_operation_wei: estimatedOperationWei.toString(),
+    estimated_operations: estimatedOperations,
+    gas_balance_shortfall_wei: shortfallWei.toString(),
+  };
+}
+
+async function confirmGasDeposit(input, state) {
+  const config = SUPPORTED_GAS_RELAY_TOKENS[input.chain];
+  const owner = checkedAddress(input.owner_address, "owner_address");
+  const depositAddress = process.env[config.depositAddressEnv];
+  if (!depositAddress || !ethers.isAddress(depositAddress)) {
+    throw httpError(503, "deposit_address_unavailable", `${config.depositAddressEnv} is not configured.`);
+  }
+
+  const provider = providerFor(input.chain, state.providers);
+  const tx = await provider.getTransaction(input.tx_hash);
+  if (!tx) {
+    throw httpError(404, "deposit_not_found", "Vaulté could not find this transaction on-chain yet.");
+  }
+  const receipt = await provider.getTransactionReceipt(input.tx_hash);
+  if (!receipt || receipt.status !== 1) {
+    throw httpError(409, "deposit_not_confirmed", "This deposit transaction is not confirmed yet.");
+  }
+  if (!tx.from || tx.from.toLowerCase() !== owner.toLowerCase()) {
+    throw httpError(400, "wrong_depositor", "This deposit was not sent from your wallet address.");
+  }
+  if (!tx.to || tx.to.toLowerCase() !== ethers.getAddress(depositAddress).toLowerCase()) {
+    throw httpError(400, "wrong_deposit_address", "This transaction was not sent to the Vaulté gas top-up address.");
+  }
+  if (tx.value <= 0n) {
+    throw httpError(400, "empty_deposit", "Deposit value is zero.");
+  }
+
+  const depositKey = `${input.chain}:${input.tx_hash.toLowerCase()}`;
+  if (!state.creditedDeposits.has(depositKey)) {
+    state.creditedDeposits.add(depositKey);
+    addCredit(input.chain, owner, tx.value, state.gasCredits);
+  }
+
+  return {
+    status: "credited",
+    chain: input.chain,
+    network_name: config.networkName,
+    address: ethers.getAddress(depositAddress),
+    recommended_usd_amount: Number(process.env.GAS_CREDIT_RECOMMENDED_USD || 20),
+    min_usd_amount: Number(process.env.GAS_CREDIT_MIN_USD || 5),
+    memo: "Send only native gas token on this network. Do not send USDT/USDC.",
+    owner_address: owner,
+    credited_wei: tx.value.toString(),
+    ...await gasCreditStatus(input.chain, owner, state.gasCredits),
+  };
 }
 
 async function handleTopUp(input, state) {
@@ -2913,78 +3078,23 @@ async function handleTopUp(input, state) {
   return result;
 }
 
-async function gasCreditStatus(chain, ownerAddress, gasCredits) {
-  const config = SUPPORTED_GAS_RELAY_TOKENS[chain];
-  if (!ownerAddress || !ethers.isAddress(ownerAddress)) {
-    return {
-      gas_balance_status: "unavailable",
-      gas_balance_message: "Open this from a wallet address to see your personal Gas Credit.",
-    };
-  }
-  const owner = ethers.getAddress(ownerAddress);
-  const balanceWei = creditBalance(chain, owner, gasCredits);
-  const estimatedOperationWei = envBigInt(
-    chain === "base" ? "BASE_ESTIMATED_GAS_OPERATION_WEI" : "ETH_ESTIMATED_GAS_OPERATION_WEI",
-    config.defaultMaxTopUpWei
-  );
-  const estimatedOperations = estimatedOperationWei > 0n
-    ? Number(balanceWei / estimatedOperationWei)
-    : 0;
-
-  return {
-    gas_balance_status: "ok",
-    gas_balance_wei: balanceWei.toString(),
-    gas_balance_native: ethers.formatEther(balanceWei),
-    estimated_operation_wei: estimatedOperationWei.toString(),
-    estimated_operations: estimatedOperations,
-  };
+function creditKey(chain, ownerAddress) {
+  return `${chain}:${ethers.getAddress(ownerAddress).toLowerCase()}`;
 }
 
-async function confirmGasDeposit(input, state) {
-  const config = SUPPORTED_GAS_RELAY_TOKENS[input.chain];
-  const owner = checkedAddress(input.owner_address, "owner_address");
-  const depositAddress = process.env[config.depositAddressEnv];
-  if (!depositAddress || !ethers.isAddress(depositAddress)) {
-    throw httpError(503, "deposit_address_unavailable", `${config.depositAddressEnv} is not configured.`);
-  }
+function creditBalance(chain, ownerAddress, gasCredits) {
+  return gasCredits.get(creditKey(chain, ownerAddress)) || 0n;
+}
 
-  const provider = providerFor(input.chain, state.providers);
-  const tx = await provider.getTransaction(input.tx_hash);
-  if (!tx) {
-    throw httpError(404, "deposit_not_found", "Vaulté could not find this transaction on-chain yet.");
-  }
-  const receipt = await provider.getTransactionReceipt(input.tx_hash);
-  if (!receipt || receipt.status !== 1) {
-    throw httpError(409, "deposit_not_confirmed", "This deposit transaction is not confirmed yet.");
-  }
-  if (!tx.from || tx.from.toLowerCase() !== owner.toLowerCase()) {
-    throw httpError(400, "wrong_depositor", "This deposit was not sent from your wallet address.");
-  }
-  if (!tx.to || tx.to.toLowerCase() !== ethers.getAddress(depositAddress).toLowerCase()) {
-    throw httpError(400, "wrong_deposit_address", "This transaction was not sent to the Vaulté gas top-up address.");
-  }
-  if (tx.value <= 0n) {
-    throw httpError(400, "empty_deposit", "Deposit value is zero.");
-  }
+function addCredit(chain, ownerAddress, amountWei, gasCredits) {
+  const key = creditKey(chain, ownerAddress);
+  gasCredits.set(key, (gasCredits.get(key) || 0n) + amountWei);
+}
 
-  const depositKey = `${input.chain}:${input.tx_hash.toLowerCase()}`;
-  if (!state.creditedDeposits.has(depositKey)) {
-    state.creditedDeposits.add(depositKey);
-    addCredit(input.chain, owner, tx.value, state.gasCredits);
-  }
-
-  return {
-    status: "credited",
-    chain: input.chain,
-    network_name: config.networkName,
-    address: ethers.getAddress(depositAddress),
-    recommended_usd_amount: Number(process.env.GAS_CREDIT_RECOMMENDED_USD || 20),
-    min_usd_amount: Number(process.env.GAS_CREDIT_MIN_USD || 5),
-    memo: "Send only native gas token on this network. Do not send USDT/USDC.",
-    owner_address: owner,
-    credited_wei: tx.value.toString(),
-    ...await gasCreditStatus(input.chain, owner, state.gasCredits),
-  };
+function debitCredit(chain, ownerAddress, amountWei, gasCredits) {
+  const key = creditKey(chain, ownerAddress);
+  const current = gasCredits.get(key) || 0n;
+  gasCredits.set(key, current > amountWei ? current - amountWei : 0n);
 }
 
 function providerFor(chain, providers) {
@@ -3016,25 +3126,6 @@ function checkedAddress(value, field) {
     throw httpError(400, "invalid_address", `${field} is not a valid EVM address.`);
   }
   return ethers.getAddress(value);
-}
-
-function creditKey(chain, ownerAddress) {
-  return `${chain}:${ethers.getAddress(ownerAddress).toLowerCase()}`;
-}
-
-function creditBalance(chain, ownerAddress, gasCredits) {
-  return gasCredits.get(creditKey(chain, ownerAddress)) || 0n;
-}
-
-function addCredit(chain, ownerAddress, amountWei, gasCredits) {
-  const key = creditKey(chain, ownerAddress);
-  gasCredits.set(key, (gasCredits.get(key) || 0n) + amountWei);
-}
-
-function debitCredit(chain, ownerAddress, amountWei, gasCredits) {
-  const key = creditKey(chain, ownerAddress);
-  const current = gasCredits.get(key) || 0n;
-  gasCredits.set(key, current > amountWei ? current - amountWei : 0n);
 }
 
 function enforceCooldown(key, topUpCooldowns) {
